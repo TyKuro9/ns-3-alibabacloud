@@ -2,9 +2,19 @@
 This folder includes code and scripts for analysis.
 
 ## FCT analysis
-`fct_analysis.py` is used to analyze fct. It reads multiple fct files (simulation's output), and prints data that can produce figures like Figure 11 (a) and (c) in [HPCC paper](https://liyuliang001.github.io/publications/hpcc.pdf).
 
-Usage: please check `python fct_analysis.py -h` and read line 20-26 in `fct_analysis.py`
+**标准流程（推荐）**：见 [FCT_STANDARD_WORKFLOW.md](./FCT_STANDARD_WORKFLOW.md)，使用：
+
+```bash
+python3 fct_standard_report.py single -n <拓扑名> <path/to/*_fct.txt>
+python3 fct_standard_report.py compare --detail --case A:pathA --case B:pathB ...
+```
+
+输出：全局统计表、实际 FCT 范围、按 `m_size` 分组（含平均 FCT / 慢化 / 备注），便于多拓扑对比。
+
+`fct_analysis.py` / `fct_analysis.cpp`：按流大小百分位分桶的 P50/P95/P99 **慢化**，用于复现 [HPCC paper](https://liyuliang001.github.io/publications/hpcc.pdf) Figure 11 类图。用法：`python fct_analysis.py -h`（或 `../fct_analysis_with_paths.py -f <fct.txt>`）。
+
+`analyze_single_fct.py`：单文件调试，逻辑与 `fct_analysis.py` 一致。
 
 ## Trace reader
 `trace_reader` is used to parse the .tr files output by the simulation.

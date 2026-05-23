@@ -1,0 +1,13 @@
+# 多拓扑 FCT 对比清单（复制为 fct_compare_manifest.txt 后修改路径）
+# 用法:
+#   while IFS= read -r line; do
+#     [[ "$line" =~ ^#|^$ ]] && continue
+#     args+=(--case "$line")
+#   done < fct_compare_manifest.txt
+#   python3 fct_standard_report.py compare --detail "${args[@]}"
+
+HPN256:../../simulation_output/HPN256/HPN256_fct.txt
+meta256:../../simulation_output/meta256/meta256_fct.txt
+Zcube256:../../simulation_output/Zcube256/Zcube256_fct.txt
+DeepSeek256:../../simulation_output/DeepSeek256/DeepSeek256_fct.txt
+ROFT256:../../simulation_output/ROFT256/ROFT256_fct.txt

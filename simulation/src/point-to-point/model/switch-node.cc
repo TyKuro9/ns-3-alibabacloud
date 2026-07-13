@@ -11,7 +11,10 @@
 #include "ppp-header.h"
 #include "ns3/int-header.h"
 #include "ns3/simulator.h"
+#include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ns3 {
 
@@ -61,12 +64,29 @@ SwitchNode::SwitchNode(){
 }
 
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
+	static const bool route_diag = [] {
+		const char* value = std::getenv("AS_NS3_ROUTE_DIAG");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	static const uint64_t route_trace_limit = [] {
+		const char* value = std::getenv("AS_NS3_ROUTE_TRACE_LIMIT");
+		return value == nullptr ? uint64_t{0} : std::strtoull(value, nullptr, 10);
+	}();
+	static std::atomic<uint64_t> traced_routes{0};
+
 	// look up entries
 	auto entry = m_rtTable.find(ch.dip);
 
 	// no matching entry
-	if (entry == m_rtTable.end())
+	if (entry == m_rtTable.end()) {
+		if (route_diag) {
+			std::fprintf(stderr,
+						 "[ns3-route-miss] time=%llu switch=%u protocol=%u sip=%u dip=%u\n",
+						 static_cast<unsigned long long>(Simulator::Now().GetTimeStep()),
+						 GetId(), unsigned(ch.l3Prot), ch.sip, ch.dip);
+		}
 		return -1;
+	}
 
 	// entry found
 	auto &nexthops = entry->second;
@@ -75,7 +95,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	union {
 		uint8_t u8[4+4+2+2];
 		uint32_t u32[3];
-	} buf;
+	} buf = {};
 	buf.u32[0] = ch.sip;
 	buf.u32[1] = ch.dip;
 	if (ch.l3Prot == 0x6)
@@ -84,8 +104,25 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		buf.u32[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+	else if (ch.l3Prot == 0xFF)
+		buf.u32[2] = ch.cnp.fid | ((uint32_t)ch.cnp.qIndex << 16);
 
-	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
+	uint32_t hash = EcmpHash(buf.u8, 12, m_ecmpSeed);
+	uint32_t idx = hash % nexthops.size();
+	uint64_t trace_index = traced_routes.load(std::memory_order_relaxed);
+	while (trace_index < route_trace_limit &&
+		   !traced_routes.compare_exchange_weak(
+				   trace_index, trace_index + 1, std::memory_order_relaxed)) {
+	}
+	if (trace_index < route_trace_limit) {
+		std::printf(
+				"[ns3-route] time=%llu switch=%u protocol=%u sip=%u dip=%u "
+				"seed=%u hash=%u candidates=%zu choice=%u out_dev=%d\n",
+				static_cast<unsigned long long>(Simulator::Now().GetTimeStep()),
+				GetId(), unsigned(ch.l3Prot), ch.sip, ch.dip, m_ecmpSeed, hash,
+				nexthops.size(), idx, nexthops[idx]);
+		std::fflush(stdout);
+	}
 	return nexthops[idx];
 }
 
@@ -105,6 +142,11 @@ void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
 }
 
 void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
+	static const uint64_t drop_trace_limit = [] {
+		const char* value = std::getenv("AS_NS3_DROP_TRACE_LIMIT");
+		return value == nullptr ? uint64_t{0} : std::strtoull(value, nullptr, 10);
+	}();
+	static std::atomic<uint64_t> admission_drops{0};
 	int idx = GetOutDev(p, ch);
 	if (idx >= 0){
 		NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
@@ -124,11 +166,42 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		uint32_t inDev = t.GetFlowId();
 		if (qIndex != 0){ //not highest priority
 			if (m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize()) && m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize())){			// Admission control
-				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
-				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
-			}else{
-				return; // Drop
-			}
+					m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
+					m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
+				}else{
+					uint64_t drop_count =
+						admission_drops.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (drop_trace_limit > 0 &&
+						(drop_count <= drop_trace_limit ||
+						 (drop_count & (drop_count - 1)) == 0)) {
+						uint16_t sport = 0, dport = 0;
+						uint64_t seq = 0;
+						if (ch.l3Prot == 0x11) {
+							sport = ch.udp.sport;
+							dport = ch.udp.dport;
+							seq = ch.udp.seq;
+						} else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD) {
+							sport = ch.ack.sport;
+							dport = ch.ack.dport;
+							seq = ch.ack.seq;
+						} else if (ch.l3Prot == 0x6) {
+							sport = ch.tcp.sport;
+							dport = ch.tcp.dport;
+							seq = ch.tcp.seq;
+						}
+						std::fprintf(
+								stderr,
+								"[ns3-admission-drop] count=%llu time=%llu switch=%u "
+								"in_dev=%u out_dev=%d queue=%u bytes=%u protocol=%u "
+								"sip=%u dip=%u sport=%u dport=%u seq=%llu\n",
+								static_cast<unsigned long long>(drop_count),
+								static_cast<unsigned long long>(Simulator::Now().GetTimeStep()),
+								GetId(), inDev, idx, qIndex, p->GetSize(),
+								unsigned(ch.l3Prot), ch.sip, ch.dip, sport, dport,
+								static_cast<unsigned long long>(seq));
+					}
+					return; // Drop
+				}
 			CheckAndSendPfc(inDev, qIndex);
 		}
 		m_bytes[inDev][idx][qIndex] += p->GetSize();

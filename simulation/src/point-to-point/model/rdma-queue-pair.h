@@ -8,6 +8,7 @@
 #include <ns3/event-id.h>
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
+#include <cstdint>
 #include <vector>
 
 namespace ns3 {
@@ -19,6 +20,15 @@ public:
 	uint16_t sport, dport;
 	uint64_t m_size, m_init_size, m_tag;
 	uint32_t m_src, m_dest;
+	int32_t m_selectedNicIdx;
+	bool m_sourceFlowletInitialized;
+	bool m_sourceFlowletDecisionPending;
+	bool m_sourcePacketSent;
+	uint64_t m_sourceLastPacketNs;
+	uint64_t m_sourceNextByteBoundary;
+	uint64_t m_sourceFlowletId;
+	std::vector<uint64_t> m_pathReservationEdges;
+	uint64_t m_pathReservationBytes;
 	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -145,6 +155,7 @@ public:
 	Ptr<RdmaQueuePair> Get(uint32_t idx);
 	Ptr<RdmaQueuePair> operator[](uint32_t idx);
 	void AddQp(Ptr<RdmaQueuePair> qp);
+	bool RemoveQp(Ptr<RdmaQueuePair> qp);
 	//void AddRxQp(Ptr<RdmaRxQueuePair> rxQp);
 	void Clear(void);
 };

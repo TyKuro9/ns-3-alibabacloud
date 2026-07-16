@@ -2,6 +2,7 @@
 #include <ns3/simple-seq-ts-header.h>
 #include <ns3/udp-header.h>
 #include <ns3/ipv4-header.h>
+#include <ns3/node-list.h>
 #include "ns3/ppp-header.h"
 #include "ns3/boolean.h"
 #include "ns3/uinteger.h"
@@ -12,12 +13,600 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+#include "nvswitch-node.h"
+#include "qbb-channel.h"
+#include "switch-node.h"
 #ifdef NS3_MTP
 #include "ns3/mtp-interface.h"
 #endif
+#include <algorithm>
+#include <cmath>
 #include <iostream>	// debug
+#include <limits>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ns3{
+
+namespace {
+
+constexpr uint32_t kMaxPathAwareHops = 32;
+
+struct PathAwareCandidate {
+	bool valid = false;
+	long double queueDelayNs = 0;
+	long double maxEdgeWorkNs = 0;
+	uint64_t propagationNs = 0;
+	uint64_t queueBytes = 0;
+	uint64_t reservedBytes = 0;
+	uint64_t bottleneckBps = std::numeric_limits<uint64_t>::max();
+	std::vector<Ptr<QbbNetDevice>> hops;
+};
+
+std::unordered_map<uint64_t, uint64_t>& PathReservedBytes() {
+	static std::unordered_map<uint64_t, uint64_t> reservations;
+	return reservations;
+}
+
+std::mutex& PathReservationMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+uint64_t PathEdgeKey(Ptr<QbbNetDevice> device) {
+	return (static_cast<uint64_t>(device->GetNode()->GetId()) << 32) |
+		static_cast<uint64_t>(device->GetIfIndex());
+}
+
+uint64_t SaturatingNs(long double value) {
+	if (value <= 0) {
+		return 0;
+	}
+	const long double maximum =
+		static_cast<long double>(std::numeric_limits<uint64_t>::max());
+	return value >= maximum
+		? std::numeric_limits<uint64_t>::max()
+		: static_cast<uint64_t>(std::llround(value));
+}
+
+long double PathScoreNs(
+		const PathAwareCandidate& path,
+		uint64_t qpBytes,
+		bool pipelinedReservations = false) {
+	if (!path.valid || path.bottleneckBps == 0 ||
+		path.bottleneckBps == std::numeric_limits<uint64_t>::max()) {
+		return std::numeric_limits<long double>::infinity();
+	}
+	const long double serializationNs =
+		static_cast<long double>(qpBytes) * 8.0L * 1000000000.0L /
+		static_cast<long double>(path.bottleneckBps);
+	return static_cast<long double>(path.propagationNs) +
+		(pipelinedReservations ? path.maxEdgeWorkNs : path.queueDelayNs) +
+		serializationNs;
+}
+
+Ptr<QbbNetDevice> GetPeerDevice(
+		Ptr<QbbNetDevice> device,
+		Ptr<QbbChannel>* channelOut) {
+	if (device == nullptr) {
+		return nullptr;
+	}
+	Ptr<QbbChannel> channel = DynamicCast<QbbChannel>(device->GetChannel());
+	if (channel == nullptr || channel->GetNDevices() != 2) {
+		return nullptr;
+	}
+	if (channelOut != nullptr) {
+		*channelOut = channel;
+	}
+	for (uint32_t index = 0; index < channel->GetNDevices(); ++index) {
+		Ptr<QbbNetDevice> candidate = channel->GetQbbDevice(index);
+		if (candidate != device) {
+			return candidate;
+		}
+	}
+	return nullptr;
+}
+
+bool AppendPathHop(
+		Ptr<QbbNetDevice> device,
+		PathAwareCandidate* path,
+		Ptr<QbbNetDevice>* peerDeviceOut = nullptr) {
+	if (device == nullptr || !device->IsLinkUp() || path == nullptr) {
+		return false;
+	}
+	const uint64_t bitRate = device->GetDataRate().GetBitRate();
+	if (bitRate == 0) {
+		return false;
+	}
+	Ptr<QbbChannel> channel;
+	Ptr<QbbNetDevice> peerDevice = GetPeerDevice(device, &channel);
+	if (peerDevice == nullptr || channel == nullptr) {
+		return false;
+	}
+
+	const uint64_t queueBytes = device->GetQueue() == nullptr
+		? 0
+		: device->GetQueue()->GetNBytesTotal();
+	const auto reservation = PathReservedBytes().find(PathEdgeKey(device));
+	const uint64_t reservedBytes = reservation == PathReservedBytes().end()
+		? 0
+		: reservation->second;
+	path->valid = true;
+	path->hops.push_back(device);
+	path->propagationNs += channel->GetDelay().GetNanoSeconds();
+	path->queueBytes += queueBytes;
+	path->reservedBytes += reservedBytes;
+	const long double edgeWorkNs =
+		static_cast<long double>(queueBytes + reservedBytes) * 8.0L *
+		1000000000.0L / static_cast<long double>(bitRate);
+	path->queueDelayNs += edgeWorkNs;
+	path->maxEdgeWorkNs = std::max(path->maxEdgeWorkNs, edgeWorkNs);
+	path->bottleneckBps = std::min(path->bottleneckBps, bitRate);
+	if (peerDeviceOut != nullptr) {
+		*peerDeviceOut = peerDevice;
+	}
+	return true;
+}
+
+std::vector<int> GetDualTableSourceCandidates(const RdmaHw& hw) {
+	std::vector<int> candidates;
+	for (uint32_t index = 0; index < hw.m_nic.size(); ++index) {
+		Ptr<QbbNetDevice> device = hw.m_nic[index].dev;
+		if (device == nullptr) {
+			continue;
+		}
+		Ptr<QbbNetDevice> peerDevice = GetPeerDevice(device, nullptr);
+		Ptr<Node> peerNode =
+			peerDevice == nullptr ? nullptr : peerDevice->GetNode();
+		if (peerNode != nullptr && peerNode->GetNodeType() == 1) {
+			candidates.push_back(static_cast<int>(index));
+		}
+	}
+	return candidates;
+}
+
+const std::vector<int>* GetRouteNextHops(Ptr<Node> node, uint32_t dip) {
+	if (node->GetNodeType() == 1) {
+		Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(node);
+		return sw == nullptr ? nullptr : sw->GetRouteNextHops(dip);
+	}
+	if (node->GetNodeType() == 2) {
+		Ptr<NVSwitchNode> sw = DynamicCast<NVSwitchNode>(node);
+		return sw == nullptr ? nullptr : sw->GetRouteNextHops(dip);
+	}
+	return nullptr;
+}
+
+bool BuildBestPathFromDevice(
+		Ptr<QbbNetDevice> device,
+		uint32_t destinationNode,
+		uint32_t dip,
+		uint32_t qpHash,
+		uint64_t qpBytes,
+		uint32_t depth,
+		std::unordered_set<uint32_t> visitedNodes,
+		PathAwareCandidate* result) {
+	if (device == nullptr || !device->IsLinkUp() || result == nullptr ||
+		depth >= kMaxPathAwareHops) {
+		return false;
+	}
+
+	PathAwareCandidate prefix;
+	Ptr<QbbNetDevice> peerDevice;
+	if (!AppendPathHop(device, &prefix, &peerDevice)) {
+		return false;
+	}
+
+	Ptr<Node> nextNode = peerDevice->GetNode();
+	if (nextNode == nullptr) {
+		return false;
+	}
+	if (nextNode->GetId() == destinationNode) {
+		*result = prefix;
+		return true;
+	}
+	if (!visitedNodes.insert(nextNode->GetId()).second) {
+		return false;
+	}
+
+	const std::vector<int>* nextHops = GetRouteNextHops(nextNode, dip);
+	if (nextHops == nullptr || nextHops->empty()) {
+		return false;
+	}
+
+	PathAwareCandidate best;
+	long double bestScore = std::numeric_limits<long double>::infinity();
+	const uint32_t start = (qpHash ^ nextNode->GetId()) % nextHops->size();
+	for (uint32_t offset = 0; offset < nextHops->size(); ++offset) {
+		const int nextHop = (*nextHops)[(start + offset) % nextHops->size()];
+		if (nextHop < 0 ||
+			static_cast<uint32_t>(nextHop) >= nextNode->GetNDevices()) {
+			continue;
+		}
+		Ptr<QbbNetDevice> nextDevice =
+			DynamicCast<QbbNetDevice>(nextNode->GetDevice(nextHop));
+		PathAwareCandidate suffix;
+		if (!BuildBestPathFromDevice(
+				nextDevice,
+				destinationNode,
+				dip,
+				qpHash,
+				qpBytes,
+				depth + 1,
+				visitedNodes,
+				&suffix)) {
+			continue;
+		}
+
+		PathAwareCandidate combined = prefix;
+		combined.hops.insert(
+			combined.hops.end(), suffix.hops.begin(), suffix.hops.end());
+		combined.propagationNs += suffix.propagationNs;
+		combined.queueDelayNs += suffix.queueDelayNs;
+		combined.maxEdgeWorkNs =
+			std::max(combined.maxEdgeWorkNs, suffix.maxEdgeWorkNs);
+		combined.queueBytes += suffix.queueBytes;
+		combined.reservedBytes += suffix.reservedBytes;
+		combined.bottleneckBps =
+			std::min(combined.bottleneckBps, suffix.bottleneckBps);
+		const long double score = PathScoreNs(
+			combined,
+			qpBytes,
+			SwitchNode::AdaptiveZcubeRoutingEnabled());
+		if (score < bestScore) {
+			best = std::move(combined);
+			bestScore = score;
+		}
+	}
+
+	if (!best.valid) {
+		return false;
+	}
+	*result = std::move(best);
+	return true;
+}
+
+std::vector<Ptr<QbbNetDevice>> GetGpuFabricDevices(Ptr<Node> gpu) {
+	std::vector<Ptr<QbbNetDevice>> devices;
+	if (gpu == nullptr || gpu->GetNodeType() != 0) {
+		return devices;
+	}
+	for (uint32_t index = 0; index < gpu->GetNDevices(); ++index) {
+		Ptr<QbbNetDevice> device =
+			DynamicCast<QbbNetDevice>(gpu->GetDevice(index));
+		Ptr<QbbNetDevice> peerDevice = GetPeerDevice(device, nullptr);
+		Ptr<Node> peerNode =
+			peerDevice == nullptr ? nullptr : peerDevice->GetNode();
+		if (peerNode != nullptr && peerNode->GetNodeType() == 1) {
+			devices.push_back(device);
+		}
+	}
+	return devices;
+}
+
+Ptr<QbbNetDevice> FindDeviceToNode(Ptr<Node> node, uint32_t peerNodeId) {
+	if (node == nullptr) {
+		return nullptr;
+	}
+	for (uint32_t index = 0; index < node->GetNDevices(); ++index) {
+		Ptr<QbbNetDevice> device =
+			DynamicCast<QbbNetDevice>(node->GetDevice(index));
+		Ptr<QbbNetDevice> peerDevice = GetPeerDevice(device, nullptr);
+		Ptr<Node> peerNode =
+			peerDevice == nullptr ? nullptr : peerDevice->GetNode();
+		if (peerNode != nullptr && peerNode->GetId() == peerNodeId) {
+			return device;
+		}
+	}
+	return nullptr;
+}
+
+bool BuildCrossPairedDualTablePath(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNodeId,
+		uint64_t qpBytes,
+		PathAwareCandidate* result) {
+	if (sourceDevice == nullptr || result == nullptr) {
+		return false;
+	}
+	Ptr<Node> sourceGpu = sourceDevice->GetNode();
+	Ptr<Node> destinationGpu = NodeList::GetNode(destinationNodeId);
+	const std::vector<Ptr<QbbNetDevice>> sourceFabricDevices =
+		GetGpuFabricDevices(sourceGpu);
+	const std::vector<Ptr<QbbNetDevice>> destinationFabricDevices =
+		GetGpuFabricDevices(destinationGpu);
+	if (sourceFabricDevices.size() != 2 ||
+		destinationFabricDevices.size() != 2) {
+		return false;
+	}
+
+	Ptr<QbbNetDevice> sourceSwitchIngress =
+		GetPeerDevice(sourceDevice, nullptr);
+	Ptr<Node> sourceSwitch = sourceSwitchIngress == nullptr
+		? nullptr
+		: sourceSwitchIngress->GetNode();
+	if (sourceSwitch == nullptr || sourceSwitch->GetNodeType() != 1) {
+		return false;
+	}
+
+	PathAwareCandidate best;
+	long double bestScore = std::numeric_limits<long double>::infinity();
+	uint32_t crossPairCount = 0;
+	for (const Ptr<QbbNetDevice>& destinationDevice :
+		 destinationFabricDevices) {
+		Ptr<QbbNetDevice> destinationSwitchEgress =
+			GetPeerDevice(destinationDevice, nullptr);
+		Ptr<Node> destinationSwitch = destinationSwitchEgress == nullptr
+			? nullptr
+			: destinationSwitchEgress->GetNode();
+		if (destinationSwitch == nullptr ||
+			destinationSwitch->GetNodeType() != 1 ||
+			destinationSwitch->GetId() == sourceSwitch->GetId()) {
+			continue;
+		}
+
+		Ptr<QbbNetDevice> interSwitchDevice = FindDeviceToNode(
+			sourceSwitch, destinationSwitch->GetId());
+		if (interSwitchDevice == nullptr) {
+			continue;
+		}
+
+		PathAwareCandidate path;
+		if (!AppendPathHop(sourceDevice, &path) ||
+			!AppendPathHop(interSwitchDevice, &path) ||
+			!AppendPathHop(destinationSwitchEgress, &path)) {
+			continue;
+		}
+		++crossPairCount;
+		const long double score = PathScoreNs(path, qpBytes);
+		if (score < bestScore) {
+			best = std::move(path);
+			bestScore = score;
+		}
+	}
+
+	// A Zcube endpoint has exactly one opposite-partition destination switch
+	// for each source switch. Refuse ambiguous topologies and use SPF instead.
+	if (crossPairCount != 1 || !best.valid) {
+		return false;
+	}
+	*result = std::move(best);
+	return true;
+}
+
+bool BuildAdaptiveDualTablePath(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNodeId,
+		uint32_t qpHash,
+		uint64_t qpBytes,
+		PathAwareCandidate* result) {
+	if (sourceDevice == nullptr || result == nullptr) {
+		return false;
+	}
+	Ptr<Node> sourceGpu = sourceDevice->GetNode();
+	Ptr<Node> destinationGpu = NodeList::GetNode(destinationNodeId);
+	const std::vector<Ptr<QbbNetDevice>> sourceFabricDevices =
+		GetGpuFabricDevices(sourceGpu);
+	const std::vector<Ptr<QbbNetDevice>> destinationFabricDevices =
+		GetGpuFabricDevices(destinationGpu);
+	if (sourceFabricDevices.size() != 2 ||
+		destinationFabricDevices.size() != 2) {
+		return false;
+	}
+
+	Ptr<QbbNetDevice> sourceSwitchIngress =
+		GetPeerDevice(sourceDevice, nullptr);
+	Ptr<Node> sourceSwitch = sourceSwitchIngress == nullptr
+		? nullptr
+		: sourceSwitchIngress->GetNode();
+	if (sourceSwitch == nullptr || sourceSwitch->GetNodeType() != 1) {
+		return false;
+	}
+
+	PathAwareCandidate best;
+	long double bestScore = std::numeric_limits<long double>::infinity();
+	auto consider = [&](PathAwareCandidate path) {
+		if (!path.valid) {
+			return;
+		}
+		const long double score = PathScoreNs(path, qpBytes, true);
+		if (score < bestScore) {
+			best = std::move(path);
+			bestScore = score;
+		}
+	};
+
+	const uint32_t destinationStart =
+		qpHash % destinationFabricDevices.size();
+	for (uint32_t destinationOffset = 0;
+		 destinationOffset < destinationFabricDevices.size();
+		 ++destinationOffset) {
+		const Ptr<QbbNetDevice>& destinationDevice =
+			destinationFabricDevices[
+				(destinationStart + destinationOffset) %
+				destinationFabricDevices.size()];
+		Ptr<QbbNetDevice> destinationSwitchEgress =
+			GetPeerDevice(destinationDevice, nullptr);
+		Ptr<Node> destinationSwitch = destinationSwitchEgress == nullptr
+			? nullptr
+			: destinationSwitchEgress->GetNode();
+		if (destinationSwitch == nullptr ||
+			destinationSwitch->GetNodeType() != 1) {
+			continue;
+		}
+
+		if (destinationSwitch->GetId() == sourceSwitch->GetId()) {
+			PathAwareCandidate direct;
+			if (AppendPathHop(sourceDevice, &direct) &&
+				AppendPathHop(destinationSwitchEgress, &direct)) {
+				consider(std::move(direct));
+			}
+			continue;
+		}
+
+		Ptr<QbbNetDevice> interSwitchDevice = FindDeviceToNode(
+			sourceSwitch, destinationSwitch->GetId());
+		if (interSwitchDevice != nullptr) {
+			PathAwareCandidate cross;
+			if (AppendPathHop(sourceDevice, &cross) &&
+				AppendPathHop(interSwitchDevice, &cross) &&
+				AppendPathHop(destinationSwitchEgress, &cross)) {
+				consider(std::move(cross));
+			}
+			continue;
+		}
+
+		// Same-partition Zcube switches need one opposite-partition relay.
+		// Rotate the scan by QP hash so equal-cost relay choices do not all
+		// start from the same physical link.
+		const uint32_t deviceCount = sourceSwitch->GetNDevices();
+		const uint32_t deviceStart = deviceCount == 0
+			? 0
+			: (qpHash ^ sourceSwitch->GetId() ^ destinationSwitch->GetId()) %
+				deviceCount;
+		for (uint32_t offset = 0; offset < deviceCount; ++offset) {
+			const uint32_t deviceIndex =
+				(deviceStart + offset) % deviceCount;
+			Ptr<QbbNetDevice> firstInterSwitchDevice =
+				DynamicCast<QbbNetDevice>(sourceSwitch->GetDevice(deviceIndex));
+			Ptr<QbbNetDevice> middleIngress =
+				GetPeerDevice(firstInterSwitchDevice, nullptr);
+			Ptr<Node> middleSwitch = middleIngress == nullptr
+				? nullptr
+				: middleIngress->GetNode();
+			if (middleSwitch == nullptr || middleSwitch->GetNodeType() != 1 ||
+				middleSwitch->GetId() == destinationSwitch->GetId()) {
+				continue;
+			}
+			Ptr<QbbNetDevice> secondInterSwitchDevice = FindDeviceToNode(
+				middleSwitch, destinationSwitch->GetId());
+			if (secondInterSwitchDevice == nullptr) {
+				continue;
+			}
+
+			PathAwareCandidate longPath;
+			if (AppendPathHop(sourceDevice, &longPath) &&
+				AppendPathHop(firstInterSwitchDevice, &longPath) &&
+				AppendPathHop(secondInterSwitchDevice, &longPath) &&
+				AppendPathHop(destinationSwitchEgress, &longPath)) {
+				consider(std::move(longPath));
+			}
+		}
+	}
+
+	if (!best.valid) {
+		return false;
+	}
+	*result = std::move(best);
+	return true;
+}
+
+bool BuildPolicyPathFromDevice(
+		Ptr<QbbNetDevice> device,
+		uint32_t destinationNode,
+		uint32_t dip,
+		uint32_t qpHash,
+		uint64_t qpBytes,
+		bool crossPairedDualTable,
+		PathAwareCandidate* result) {
+	if (crossPairedDualTable) {
+		if (SwitchNode::AdaptiveZcubeRoutingEnabled() &&
+			BuildAdaptiveDualTablePath(
+				device,
+				destinationNode,
+				qpHash,
+				qpBytes,
+				result)) {
+			return true;
+		}
+		if (!SwitchNode::AdaptiveZcubeRoutingEnabled() &&
+			BuildCrossPairedDualTablePath(
+				device, destinationNode, qpBytes, result)) {
+			return true;
+		}
+	}
+	std::unordered_set<uint32_t> visitedNodes{device->GetNode()->GetId()};
+	return BuildBestPathFromDevice(
+		device,
+		destinationNode,
+		dip,
+		qpHash,
+		qpBytes,
+		0,
+		std::move(visitedNodes),
+		result);
+}
+
+void BindPathAwareRoute(
+		Ptr<RdmaQueuePair> qp,
+		const PathAwareCandidate& path,
+		uint64_t reservationBytes) {
+	for (const Ptr<QbbNetDevice>& device : path.hops) {
+		const uint64_t edge = PathEdgeKey(device);
+		PathReservedBytes()[edge] += reservationBytes;
+		qp->m_pathReservationEdges.push_back(edge);
+
+		Ptr<Node> node = device->GetNode();
+		if (node->GetNodeType() == 1) {
+			DynamicCast<SwitchNode>(node)->BindPathAwareQpRoute(
+				qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport,
+				device->GetIfIndex());
+		} else if (node->GetNodeType() == 2) {
+			DynamicCast<NVSwitchNode>(node)->BindPathAwareQpRoute(
+				qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport,
+				device->GetIfIndex());
+		}
+	}
+	qp->m_pathReservationBytes = reservationBytes;
+}
+
+void ReleasePathAwareRouteLocked(Ptr<RdmaQueuePair> qp) {
+	if (qp == nullptr || qp->m_pathReservationEdges.empty()) {
+		return;
+	}
+	for (const uint64_t edge : qp->m_pathReservationEdges) {
+		auto reservation = PathReservedBytes().find(edge);
+		if (reservation != PathReservedBytes().end()) {
+			if (reservation->second <= qp->m_pathReservationBytes) {
+				PathReservedBytes().erase(reservation);
+			} else {
+				reservation->second -= qp->m_pathReservationBytes;
+			}
+		}
+
+		const uint32_t nodeId = static_cast<uint32_t>(edge >> 32);
+		Ptr<Node> node = NodeList::GetNode(nodeId);
+		if (node == nullptr) {
+			continue;
+		}
+		if (node->GetNodeType() == 1) {
+			DynamicCast<SwitchNode>(node)->UnbindPathAwareQpRoute(
+				qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport);
+		} else if (node->GetNodeType() == 2) {
+			DynamicCast<NVSwitchNode>(node)->UnbindPathAwareQpRoute(
+				qp->sip.Get(), qp->dip.Get(), qp->sport, qp->dport);
+		}
+	}
+	qp->m_pathReservationEdges.clear();
+	qp->m_pathReservationBytes = 0;
+}
+
+void ReleasePathAwareRoute(Ptr<RdmaQueuePair> qp) {
+	std::lock_guard<std::mutex> guard(PathReservationMutex());
+	ReleasePathAwareRouteLocked(qp);
+}
+
+void RebindPathAwareRoute(
+		Ptr<RdmaQueuePair> qp,
+		const PathAwareCandidate& path,
+		uint64_t reservationBytes) {
+	std::lock_guard<std::mutex> guard(PathReservationMutex());
+	ReleasePathAwareRouteLocked(qp);
+	BindPathAwareRoute(qp, path, reservationBytes);
+}
+
+}  // namespace
 
 TypeId RdmaHw::GetTypeId (void)
 {
@@ -229,8 +818,9 @@ void RdmaHw::Setup(QpCompleteCallback cb,SendCompleteCallback send_cb){
 		// setup callback
 		dev->m_rdmaReceiveCb = MakeCallback(&RdmaHw::Receive, this);
         dev->m_rdmaSentCb = MakeCallback(&RdmaHw::SendPacketComplete, this);
-        dev->m_rdmaLinkDownCb = MakeCallback(&RdmaHw::SetLinkDown, this);
+		dev->m_rdmaLinkDownCb = MakeCallback(&RdmaHw::SetLinkDown, this);
 		dev->m_rdmaPktSent = MakeCallback(&RdmaHw::PktSent, this);
+		dev->m_rdmaSelectTxNic = MakeCallback(&RdmaHw::SelectTxNic, this);
 		dev->m_rdmaUpdateTxBytes = MakeCallback(&RdmaHw::UpdateTxBytes, this);
 		// config NIC
 		dev->m_rdmaEQ->m_rdmaGetNxtPkt = MakeCallback(&RdmaHw::GetNxtPacket, this);
@@ -243,22 +833,472 @@ uint32_t ip_to_node_id(Ipv4Address ip) { return (ip.Get() >> 8) & 0xffff; }
 uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 	uint32_t src = qp->m_src;
 	uint32_t dst = qp->m_dest;
-	if(src / m_gpus_per_server == dst / m_gpus_per_server || m_rtTable_nxthop_nvswitch.count(qp->dip.Get()) != 0){ // src and dst are in the same server, communicate through nvswitch
-		auto &v = m_rtTable_nxthop_nvswitch[qp->dip.Get()];
-		if (v.size() > 0){
-			return v[qp->GetHash() % v.size()];
-		}else{
-			NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
+	const bool sameServer =
+		src / m_gpus_per_server == dst / m_gpus_per_server;
+	std::vector<int> dualTableCandidates;
+	std::vector<int>* candidates = nullptr;
+	if (sameServer || m_rtTable_nxthop_nvswitch.count(qp->dip.Get()) != 0) {
+		auto routes = m_rtTable_nxthop_nvswitch.find(qp->dip.Get());
+		if (routes != m_rtTable_nxthop_nvswitch.end()) {
+			candidates = &routes->second;
 		}
-	}else{ // src and dst don't in the same server, communicate through swicth
-		auto &v = m_rtTable[qp->dip.Get()];
-		if (v.size() > 0){
-			return v[qp->GetHash() % v.size()];
-		}else{
-			NS_ASSERT_MSG(false, "We assume at least one NIC is alive");
+	} else if (SwitchNode::DualTableRoutingEnabled()) {
+		// A dual-table route is shortest only after its physical source NIC is
+		// fixed. Do not filter the second NIC through the global source SPF.
+		dualTableCandidates = GetDualTableSourceCandidates(*this);
+		if (!dualTableCandidates.empty()) {
+			candidates = &dualTableCandidates;
+		}
+	} else {
+		auto routes = m_rtTable.find(qp->dip.Get());
+		if (routes != m_rtTable.end()) {
+			candidates = &routes->second;
 		}
 	}
+
+	NS_ASSERT_MSG(
+		candidates != nullptr && !candidates->empty(),
+		"We assume at least one NIC is alive");
+	auto &v = *candidates;
+	if (qp->m_selectedNicIdx >= 0) {
+		const int selected = qp->m_selectedNicIdx;
+		if (std::find(v.begin(), v.end(), selected) != v.end() &&
+			static_cast<uint32_t>(selected) < m_nic.size() &&
+			m_nic[selected].dev != nullptr &&
+			m_nic[selected].dev->IsLinkUp()) {
+			return static_cast<uint32_t>(selected);
+		}
+		ReleasePathAwareRoute(qp);
+		qp->m_selectedNicIdx = -1;
+	}
+
+	const bool pathAwarePolicy =
+		SwitchNode::PathAwareQpRoutingEnabled() &&
+		src / m_gpus_per_server != dst / m_gpus_per_server;
+	const bool dynamic =
+		SwitchNode::DynamicQpRoutingEnabled() && v.size() > 1;
+	uint32_t selected = v[qp->GetHash() % v.size()];
+	uint32_t viableCandidates = static_cast<uint32_t>(v.size());
+	uint64_t selectedActiveBytes = 0;
+	uint64_t selectedActiveQps = 0;
+	uint64_t selectedTxBytes =
+		selected < tx_bytes.size() ? tx_bytes[selected] : 0;
+	bool usedPathAware = false;
+	bool usedStaticFallback = false;
+	uint64_t selectedPathScoreNs = 0;
+	uint64_t selectedPathQueueDelayNs = 0;
+	uint64_t selectedPathPropagationNs = 0;
+	uint64_t selectedPathReservedBytes = 0;
+	uint32_t selectedPathHops = 0;
+
+	if (pathAwarePolicy) {
+		std::lock_guard<std::mutex> guard(PathReservationMutex());
+		uint32_t pathSelected = std::numeric_limits<uint32_t>::max();
+		PathAwareCandidate bestPath;
+		long double bestScore = std::numeric_limits<long double>::infinity();
+		viableCandidates = 0;
+		const uint32_t start = qp->GetHash() % v.size();
+		for (uint32_t offset = 0; offset < v.size(); ++offset) {
+			const int candidate = v[(start + offset) % v.size()];
+			if (candidate < 0 ||
+				static_cast<uint32_t>(candidate) >= m_nic.size() ||
+				m_nic[candidate].dev == nullptr ||
+				!m_nic[candidate].dev->IsLinkUp()) {
+				continue;
+			}
+			PathAwareCandidate path;
+			if (!BuildPolicyPathFromDevice(
+					m_nic[candidate].dev,
+					ip_to_node_id(qp->dip),
+					qp->dip.Get(),
+					qp->GetHash(),
+					qp->GetInitialSize(),
+					SwitchNode::DualTableRoutingEnabled(),
+					&path)) {
+				continue;
+			}
+			++viableCandidates;
+			const bool pipelinedReservations =
+				SwitchNode::AdaptiveZcubeRoutingEnabled();
+			const long double score = PathScoreNs(
+				path,
+				qp->GetInitialSize(),
+				pipelinedReservations);
+			if (score < bestScore) {
+				pathSelected = static_cast<uint32_t>(candidate);
+				bestPath = std::move(path);
+				bestScore = score;
+			}
+		}
+
+		if (pathSelected != std::numeric_limits<uint32_t>::max()) {
+			selected = pathSelected;
+			selectedPathScoreNs = SaturatingNs(bestScore);
+			selectedPathQueueDelayNs = SaturatingNs(
+				SwitchNode::AdaptiveZcubeRoutingEnabled()
+					? bestPath.maxEdgeWorkNs
+					: bestPath.queueDelayNs);
+			selectedPathPropagationNs = bestPath.propagationNs;
+			selectedPathReservedBytes = bestPath.reservedBytes;
+			selectedPathHops = static_cast<uint32_t>(bestPath.hops.size());
+			BindPathAwareRoute(qp, bestPath, qp->GetBytesLeft());
+			usedPathAware = true;
+		}
+	}
+
+	if (!usedPathAware && pathAwarePolicy &&
+		SwitchNode::DualTableRoutingEnabled()) {
+		// If the conditional path search cannot reach the destination (for
+		// example after a link failure), fall back only to a live source NIC
+		// from the original global SPF table. Picking an arbitrary live first
+		// hop can bind the QP to a path whose downstream segment is broken.
+		auto fallbackRoutes = m_rtTable.find(qp->dip.Get());
+		if (fallbackRoutes != m_rtTable.end() && !fallbackRoutes->second.empty()) {
+			const std::vector<int>& fallback = fallbackRoutes->second;
+			const uint32_t start = qp->GetHash() % fallback.size();
+			viableCandidates = 0;
+			for (uint32_t offset = 0; offset < fallback.size(); ++offset) {
+				const int candidate = fallback[(start + offset) % fallback.size()];
+				if (candidate < 0 ||
+					static_cast<uint32_t>(candidate) >= m_nic.size() ||
+					m_nic[candidate].dev == nullptr ||
+					!m_nic[candidate].dev->IsLinkUp()) {
+					continue;
+				}
+				++viableCandidates;
+				if (!usedStaticFallback) {
+					selected = static_cast<uint32_t>(candidate);
+					usedStaticFallback = true;
+				}
+			}
+		}
+		NS_ASSERT_MSG(
+			usedStaticFallback,
+			"Dual-table routing found no reachable source NIC");
+	}
+
+	if (!usedPathAware && !usedStaticFallback && dynamic) {
+		selected = std::numeric_limits<uint32_t>::max();
+		viableCandidates = 0;
+		uint64_t bestActiveBytes = std::numeric_limits<uint64_t>::max();
+		uint64_t bestActiveQps = std::numeric_limits<uint64_t>::max();
+		uint64_t bestTxBytes = std::numeric_limits<uint64_t>::max();
+		const uint32_t start = qp->GetHash() % v.size();
+		for (uint32_t offset = 0; offset < v.size(); ++offset) {
+			const int candidate = v[(start + offset) % v.size()];
+			if (candidate < 0 ||
+				static_cast<uint32_t>(candidate) >= m_nic.size() ||
+				m_nic[candidate].dev == nullptr ||
+				!m_nic[candidate].dev->IsLinkUp()) {
+				continue;
+			}
+			++viableCandidates;
+			uint64_t activeBytes = 0;
+			uint64_t activeQps = 0;
+			Ptr<RdmaQueuePairGroup> group = m_nic[candidate].qpGrp;
+			if (group != nullptr) {
+				for (uint32_t index = 0; index < group->GetN(); ++index) {
+					Ptr<RdmaQueuePair> activeQp = group->Get(index);
+					const uint64_t outstanding =
+						activeQp->GetBytesLeft() + activeQp->GetOnTheFly();
+					if (outstanding > 0) {
+						activeBytes += outstanding;
+						++activeQps;
+					}
+				}
+			}
+			const uint64_t sentBytes =
+				static_cast<uint32_t>(candidate) < tx_bytes.size()
+					? tx_bytes[candidate]
+					: 0;
+			const bool better =
+				activeBytes < bestActiveBytes ||
+				(activeBytes == bestActiveBytes && activeQps < bestActiveQps) ||
+				(activeBytes == bestActiveBytes && activeQps == bestActiveQps &&
+				 sentBytes < bestTxBytes);
+			if (better) {
+				selected = static_cast<uint32_t>(candidate);
+				bestActiveBytes = activeBytes;
+				bestActiveQps = activeQps;
+				bestTxBytes = sentBytes;
+			}
+		}
+		NS_ASSERT_MSG(
+			selected != std::numeric_limits<uint32_t>::max(),
+			"Dynamic QP routing found no live NIC");
+		selectedActiveBytes = bestActiveBytes;
+		selectedActiveQps = bestActiveQps;
+		selectedTxBytes = bestTxBytes;
+	}
+
+	if (usedPathAware) {
+		Ptr<RdmaQueuePairGroup> group = m_nic[selected].qpGrp;
+		if (group != nullptr) {
+			for (uint32_t index = 0; index < group->GetN(); ++index) {
+				Ptr<RdmaQueuePair> activeQp = group->Get(index);
+				const uint64_t outstanding =
+					activeQp->GetBytesLeft() + activeQp->GetOnTheFly();
+				if (outstanding > 0) {
+					selectedActiveBytes += outstanding;
+					++selectedActiveQps;
+				}
+			}
+		}
+		selectedTxBytes = selected < tx_bytes.size() ? tx_bytes[selected] : 0;
+	}
+
+	qp->m_selectedNicIdx = static_cast<int32_t>(selected);
+	SwitchNode::RecordSourceQpBindingStats(
+		dynamic || usedPathAware,
+		usedPathAware,
+		src,
+		selected,
+		viableCandidates,
+		selectedActiveBytes,
+		selectedTxBytes,
+		selectedActiveQps,
+		qp->sip.Get(),
+		qp->dip.Get(),
+		qp->sport,
+		qp->dport,
+		qp->GetInitialSize(),
+		selectedPathScoreNs,
+		selectedPathQueueDelayNs,
+		selectedPathPropagationNs,
+		selectedPathReservedBytes,
+		selectedPathHops);
+	return selected;
 }
+
+uint32_t RdmaHw::SelectTxNic(
+		Ptr<RdmaQueuePair> qp,
+		uint32_t currentNic) {
+	if (qp == nullptr || !SwitchNode::FlowletRoutingEnabled() ||
+		m_node == nullptr || m_node->GetNodeType() != 0 ||
+		qp->m_src / m_gpus_per_server == qp->m_dest / m_gpus_per_server) {
+		return currentNic;
+	}
+
+	std::vector<int> dualTableCandidates;
+	const std::vector<int>* candidateTable = nullptr;
+	if (SwitchNode::DualTableRoutingEnabled()) {
+		dualTableCandidates = GetDualTableSourceCandidates(*this);
+		candidateTable = &dualTableCandidates;
+	} else {
+		auto routes = m_rtTable.find(qp->dip.Get());
+		if (routes != m_rtTable.end()) {
+			candidateTable = &routes->second;
+		}
+	}
+	if (candidateTable == nullptr || candidateTable->size() <= 1) {
+		return currentNic;
+	}
+	const std::vector<int>& candidates = *candidateTable;
+	auto isLiveCandidate = [&](uint32_t candidate) {
+		return std::find(
+			candidates.begin(), candidates.end(), static_cast<int>(candidate)) !=
+				candidates.end() &&
+			candidate < m_nic.size() && m_nic[candidate].dev != nullptr &&
+			m_nic[candidate].dev->IsLinkUp();
+	};
+
+	const bool currentLive = isLiveCandidate(currentNic);
+	if (qp->m_sourceFlowletDecisionPending && currentLive) {
+		return currentNic;
+	}
+	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+	const uint64_t gapNs = SwitchNode::FlowletGapNs();
+	const uint64_t maxBytes = SwitchNode::FlowletMaxBytes();
+	const bool firstDecision = !qp->m_sourceFlowletInitialized;
+	const bool gapTriggered =
+		qp->m_sourceFlowletInitialized && qp->m_sourcePacketSent &&
+		nowNs >= qp->m_sourceLastPacketNs &&
+		nowNs - qp->m_sourceLastPacketNs >= gapNs;
+	const bool byteTriggered =
+		qp->m_sourceFlowletInitialized && maxBytes > 0 &&
+		qp->snd_nxt >= qp->m_sourceNextByteBoundary;
+	const bool linkTriggered = !currentLive;
+	if (!firstDecision && !gapTriggered && !byteTriggered && !linkTriggered) {
+		return currentNic;
+	}
+	if (firstDecision && currentLive) {
+		qp->m_sourceFlowletInitialized = true;
+		qp->m_sourceFlowletDecisionPending = true;
+		qp->m_sourceFlowletId = 0;
+		if (maxBytes > 0) {
+			const uint64_t remainder = qp->snd_nxt % maxBytes;
+			const uint64_t increment = maxBytes - remainder;
+			qp->m_sourceNextByteBoundary =
+				qp->snd_nxt > std::numeric_limits<uint64_t>::max() - increment
+					? std::numeric_limits<uint64_t>::max()
+					: qp->snd_nxt + increment;
+		}
+		return currentNic;
+	}
+	// A source-NIC migration is reorder-safe only after the previous flowlet
+	// has been acknowledged. Link failure is the exception because staying on
+	// the failed rail cannot make progress.
+	if (!firstDecision && !linkTriggered && qp->GetOnTheFly() > 0) {
+		return currentNic;
+	}
+	if (SwitchNode::DualTableRoutingEnabled()) {
+		// Do not charge the QP's old reservation to itself while comparing the
+		// two conditional shortest-path tables at a safe flowlet boundary.
+		ReleasePathAwareRoute(qp);
+	}
+
+	const uint64_t flowletId = firstDecision
+		? 0
+		: (qp->m_sourceFlowletId == std::numeric_limits<uint64_t>::max()
+			? qp->m_sourceFlowletId
+			: qp->m_sourceFlowletId + 1);
+	const uint64_t bytesLeft = qp->GetBytesLeft();
+	const uint64_t scoreBytes = maxBytes > 0
+		? std::min(maxBytes, bytesLeft)
+		: std::min(static_cast<uint64_t>(m_mtu), bytesLeft);
+	const uint32_t flowletHash = qp->GetHash() ^
+		static_cast<uint32_t>(flowletId * 0x9e3779b97f4a7c15ULL);
+
+	uint32_t selected = std::numeric_limits<uint32_t>::max();
+	uint32_t viableCandidates = 0;
+	PathAwareCandidate selectedPath;
+	PathAwareCandidate currentPath;
+	long double selectedScore = std::numeric_limits<long double>::infinity();
+	long double currentScore = std::numeric_limits<long double>::infinity();
+	{
+		std::lock_guard<std::mutex> guard(PathReservationMutex());
+		const uint32_t start =
+			(flowletHash + static_cast<uint32_t>(flowletId)) % candidates.size();
+		for (uint32_t offset = 0; offset < candidates.size(); ++offset) {
+			const int candidateValue =
+				candidates[(start + offset) % candidates.size()];
+			if (candidateValue < 0) {
+				continue;
+			}
+			const uint32_t candidate = static_cast<uint32_t>(candidateValue);
+			if (!isLiveCandidate(candidate)) {
+				continue;
+			}
+			PathAwareCandidate path;
+			if (!BuildPolicyPathFromDevice(
+					m_nic[candidate].dev,
+					ip_to_node_id(qp->dip),
+					qp->dip.Get(),
+					flowletHash,
+					scoreBytes,
+					SwitchNode::DualTableRoutingEnabled(),
+					&path)) {
+				continue;
+			}
+			++viableCandidates;
+			const long double score = PathScoreNs(path, scoreBytes);
+			if (candidate == currentNic) {
+				currentPath = path;
+				currentScore = score;
+			}
+			if (score < selectedScore) {
+				selected = candidate;
+				selectedPath = std::move(path);
+				selectedScore = score;
+			}
+		}
+	}
+
+	if (selected == std::numeric_limits<uint32_t>::max()) {
+		// Drop back to a source NIC from the normal global SPF table. This
+		// leaves downstream forwarding to the existing ECMP tables and avoids
+		// choosing a merely link-up dual-table NIC with no reachable suffix.
+		auto fallbackRoutes = m_rtTable.find(qp->dip.Get());
+		if (fallbackRoutes != m_rtTable.end() && !fallbackRoutes->second.empty()) {
+			const std::vector<int>& fallback = fallbackRoutes->second;
+			const uint32_t start = flowletHash % fallback.size();
+			viableCandidates = 0;
+			for (uint32_t offset = 0; offset < fallback.size(); ++offset) {
+				const int candidateValue =
+					fallback[(start + offset) % fallback.size()];
+				if (candidateValue < 0) {
+					continue;
+				}
+				const uint32_t candidate =
+					static_cast<uint32_t>(candidateValue);
+				if (candidate >= m_nic.size() ||
+					m_nic[candidate].dev == nullptr ||
+					!m_nic[candidate].dev->IsLinkUp()) {
+					continue;
+				}
+				++viableCandidates;
+				if (selected == std::numeric_limits<uint32_t>::max() ||
+					candidate == currentNic) {
+					selected = candidate;
+				}
+			}
+		}
+		NS_ASSERT_MSG(
+			selected != std::numeric_limits<uint32_t>::max(),
+			"Dual-table routing found no reachable source NIC");
+		selectedScore = 0;
+	} else if (selected != currentNic && currentPath.valid &&
+		selectedScore +
+			static_cast<long double>(SwitchNode::FlowletHysteresisNs()) >=
+			currentScore) {
+		selected = currentNic;
+		selectedPath = currentPath;
+		selectedScore = currentScore;
+	}
+
+	if (SwitchNode::DualTableRoutingEnabled()) {
+		if (selectedPath.valid) {
+			RebindPathAwareRoute(
+				qp, selectedPath, qp->GetBytesLeft());
+		} else if (selected != currentNic) {
+			ReleasePathAwareRoute(qp);
+		}
+	}
+
+	qp->m_selectedNicIdx = static_cast<int32_t>(selected);
+	qp->m_sourceFlowletInitialized = true;
+	qp->m_sourceFlowletDecisionPending = true;
+	qp->m_sourceFlowletId = flowletId;
+	if (maxBytes > 0) {
+		const uint64_t remainder = qp->snd_nxt % maxBytes;
+		const uint64_t increment = maxBytes - remainder;
+		qp->m_sourceNextByteBoundary =
+			qp->snd_nxt > std::numeric_limits<uint64_t>::max() - increment
+				? std::numeric_limits<uint64_t>::max()
+				: qp->snd_nxt + increment;
+	}
+
+	const bool switched = selected != currentNic;
+	const uint64_t selectedQueueBytes =
+		selectedPath.queueBytes >
+			std::numeric_limits<uint64_t>::max() - selectedPath.reservedBytes
+			? std::numeric_limits<uint64_t>::max()
+			: selectedPath.queueBytes + selectedPath.reservedBytes;
+	SwitchNode::RecordSourceFlowletDecisionStats(
+		m_node->GetId(),
+		selected,
+		viableCandidates,
+		selectedQueueBytes,
+		selected < tx_bytes.size() ? tx_bytes[selected] : 0,
+		SaturatingNs(selectedScore),
+		std::isfinite(currentScore) ? SaturatingNs(currentScore) : 0,
+		SaturatingNs(selectedPath.queueDelayNs),
+		selectedPath.propagationNs,
+		selectedPath.reservedBytes,
+		static_cast<uint32_t>(selectedPath.hops.size()),
+		flowletId,
+		nowNs,
+		switched,
+		gapTriggered,
+		byteTriggered,
+		linkTriggered,
+		qp->sip.Get(),
+		qp->dip.Get(),
+		qp->sport,
+		qp->dport);
+	return selected;
+}
+
 uint64_t RdmaHw::GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg){
 	return ((uint64_t)dip << 32) | ((uint64_t)sport << 16) | (uint64_t)pg;
 }
@@ -319,6 +1359,7 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 }
 
 void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
+	ReleasePathAwareRoute(qp);
 	// remove qp from the m_qpMap
 	uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
 	m_qpMap.erase(key);
@@ -724,6 +1765,40 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 
 void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap){
 	qp->lastPktSize = pkt->GetSize();
+	if (SwitchNode::FlowletRoutingEnabled() && m_node != nullptr &&
+		m_node->GetNodeType() == 0) {
+		qp->m_sourcePacketSent = true;
+		qp->m_sourceFlowletDecisionPending = false;
+		qp->m_sourceLastPacketNs = Simulator::Now().GetNanoSeconds();
+		if (qp->m_selectedNicIdx >= 0) {
+			uint32_t candidateCount = 0;
+			const bool sameServer =
+				qp->m_src / m_gpus_per_server ==
+				qp->m_dest / m_gpus_per_server;
+			if (!sameServer && SwitchNode::DualTableRoutingEnabled()) {
+				candidateCount = static_cast<uint32_t>(
+					GetDualTableSourceCandidates(*this).size());
+			} else {
+				const auto& routeTable = sameServer
+					? m_rtTable_nxthop_nvswitch
+					: m_rtTable;
+				auto routes = routeTable.find(qp->dip.Get());
+				if (routes != routeTable.end()) {
+					candidateCount =
+						static_cast<uint32_t>(routes->second.size());
+				}
+			}
+			SwitchNode::RecordSourceFlowletPacketStats(
+				m_node->GetId(),
+				static_cast<uint32_t>(qp->m_selectedNicIdx),
+				candidateCount,
+				qp->sip.Get(),
+				qp->dip.Get(),
+				qp->sport,
+				qp->dport,
+				pkt->GetSize());
+		}
+	}
 	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
 }
 

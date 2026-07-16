@@ -309,6 +309,29 @@ namespace ns3 {
 				}
 				// a qp dequeue a packet
 				Ptr<RdmaQueuePair> lastQp = m_rdmaEQ->GetQp(qIndex);
+				if (!m_rdmaSelectTxNic.IsNull()) {
+					const uint32_t selectedNic =
+						m_rdmaSelectTxNic(lastQp, m_ifIndex);
+					if (selectedNic != m_ifIndex) {
+						NS_ASSERT_MSG(
+							selectedNic < m_node->GetNDevices(),
+							"Flowlet routing selected an invalid NIC index");
+						Ptr<QbbNetDevice> target = DynamicCast<QbbNetDevice>(
+							m_node->GetDevice(selectedNic));
+						NS_ASSERT_MSG(
+							target != nullptr && target->IsLinkUp(),
+							"Flowlet routing selected an unavailable NIC");
+						NS_ASSERT_MSG(
+							m_rdmaEQ->m_qpGrp->RemoveQp(lastQp),
+							"Flowlet QP is missing from its current NIC queue");
+						target->m_rdmaEQ->m_qpGrp->AddQp(lastQp);
+						Simulator::ScheduleNow(
+							&QbbNetDevice::DequeueAndTransmit, this);
+						Simulator::ScheduleNow(
+							&QbbNetDevice::ReassignedQp, target, lastQp);
+						return;
+					}
+				}
 				p = m_rdmaEQ->DequeueQindex(qIndex);
 				// update statistics for monitor
 				m_rdmaUpdateTxBytes(m_ifIndex, p->GetSize());

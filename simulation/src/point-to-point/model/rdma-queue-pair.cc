@@ -6,6 +6,7 @@
 #include <ns3/simulator.h>
 #include "ns3/ppp-header.h"
 #include "rdma-queue-pair.h"
+#include <algorithm>
 
 namespace ns3 {
 
@@ -30,6 +31,14 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_init_size = 0;
 	m_src = -1;
 	m_dest = -1;
+	m_selectedNicIdx = -1;
+	m_sourceFlowletInitialized = false;
+	m_sourceFlowletDecisionPending = false;
+	m_sourcePacketSent = false;
+	m_sourceLastPacketNs = 0;
+	m_sourceNextByteBoundary = 0;
+	m_sourceFlowletId = 0;
+	m_pathReservationBytes = 0;
 	m_tag = -1;
 	snd_nxt = snd_una = 0;
 	m_pg = pg;
@@ -259,6 +268,16 @@ Ptr<RdmaQueuePair> RdmaQueuePairGroup::operator[](uint32_t idx){
 
 void RdmaQueuePairGroup::AddQp(Ptr<RdmaQueuePair> qp){
 	m_qps.push_back(qp);
+}
+
+bool RdmaQueuePairGroup::RemoveQp(Ptr<RdmaQueuePair> qp){
+	auto position = std::find(m_qps.begin(), m_qps.end(), qp);
+	if (position == m_qps.end()) {
+		return false;
+	}
+	*position = m_qps.back();
+	m_qps.pop_back();
+	return true;
 }
 
 #if 0

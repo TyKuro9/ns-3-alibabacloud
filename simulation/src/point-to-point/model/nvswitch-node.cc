@@ -8,10 +8,13 @@
 #include "ns3/double.h"
 #include "nvswitch-node.h"
 #include "qbb-net-device.h"
+#include "switch-node.h"
 #include "ppp-header.h"
 #include "ns3/int-header.h"
 #include "ns3/simulator.h"
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace ns3 {
 
@@ -39,6 +42,7 @@ NVSwitchNode::NVSwitchNode(){
 				m_bytes[i][j][k] = 0;
 	for (uint32_t i = 0; i < pCnt; i++){
 		m_txBytes[i] = 0;
+		m_dynamicPortAssignments[i] = 0;
 		last_txBytes[i] = 0;
 		last_port_qlen[i] = 0;
 	}
@@ -49,6 +53,26 @@ NVSwitchNode::NVSwitchNode(){
 }
 
 int NVSwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
+	if (SwitchNode::DualTableRoutingEnabled() && ch.l3Prot == 0x11) {
+		std::lock_guard<std::mutex> routeGuard(m_dynamicQpRoutesMutex);
+		const QpRouteKey qpKey{
+			ch.sip,
+			ch.dip,
+			ch.udp.sport,
+			ch.udp.dport,
+		};
+		auto bound = m_dynamicQpRoutes.find(qpKey);
+		if (bound != m_dynamicQpRoutes.end()) {
+			const int outDev = bound->second;
+			if (outDev >= 0 &&
+				static_cast<uint32_t>(outDev) < GetNDevices() &&
+				m_devices[outDev]->IsLinkUp()) {
+				return outDev;
+			}
+			m_dynamicQpRoutes.erase(bound);
+		}
+	}
+
 	// look up entries
 	auto entry = m_rtTable.find(ch.dip);
 
@@ -58,20 +82,242 @@ int NVSwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 
 	// entry found
 	auto &nexthops = entry->second;
+	if (nexthops.empty())
+		return -1;
 
-	// pick one next hop based on hash
 	union {
 		uint8_t u8[4+4+2+2];
 		uint32_t u32[3];
 	} buf;
 	buf.u32[0] = ch.sip;
 	buf.u32[1] = ch.dip;
+	buf.u32[2] = 0;
 	if (ch.l3Prot == 0x6)
 		buf.u32[2] = ch.tcp.sport | ((uint32_t)ch.tcp.dport << 16);
 	else if (ch.l3Prot == 0x11)
 		buf.u32[2] = ch.udp.sport | ((uint32_t)ch.udp.dport << 16);
 	else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
 		buf.u32[2] = ch.ack.sport | ((uint32_t)ch.ack.dport << 16);
+
+	if (SwitchNode::FlowletRoutingEnabled() &&
+		ch.l3Prot == 0x11 && nexthops.size() > 1) {
+		std::lock_guard<std::mutex> routeGuard(m_dynamicQpRoutesMutex);
+		const QpRouteKey qpKey{
+			ch.sip,
+			ch.dip,
+			ch.udp.sport,
+			ch.udp.dport,
+		};
+		const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+		auto cached = m_flowletRoutes.find(qpKey);
+		const bool hasCached = cached != m_flowletRoutes.end();
+		const int previousDev = hasCached ? cached->second.outDev : -1;
+		const bool previousEligible =
+			hasCached && previousDev >= 0 &&
+			static_cast<uint32_t>(previousDev) < GetNDevices() &&
+			m_devices[previousDev]->IsLinkUp() &&
+			std::find(nexthops.begin(), nexthops.end(), previousDev) !=
+				nexthops.end();
+		const uint64_t gapNs = SwitchNode::FlowletGapNs();
+		const uint64_t maxBytes = SwitchNode::FlowletMaxBytes();
+		const bool gapTriggered =
+			hasCached && gapNs > 0 && nowNs >= cached->second.lastPacketNs &&
+			nowNs - cached->second.lastPacketNs >= gapNs;
+		const bool byteTriggered =
+			hasCached && maxBytes > 0 &&
+			ch.udp.seq >= cached->second.nextByteBoundary;
+		const bool linkTriggered = hasCached && !previousEligible;
+		const bool shouldReevaluate =
+			!hasCached || gapTriggered || byteTriggered || linkTriggered;
+
+		if (!shouldReevaluate) {
+			cached->second.lastPacketNs = nowNs;
+			return previousDev;
+		}
+
+		const uint64_t flowletId =
+			hasCached ? cached->second.flowletId + 1 : 0;
+		const uint32_t flowletSeed =
+			m_ecmpSeed ^ static_cast<uint32_t>(flowletId * 0x9e3779b9ULL);
+		const uint32_t start = EcmpHash(buf.u8, 12, flowletSeed) % nexthops.size();
+		int bestDev = -1;
+		uint64_t bestScoreNs = std::numeric_limits<uint64_t>::max();
+		uint64_t bestQueueBytes = std::numeric_limits<uint64_t>::max();
+		uint64_t bestTxBytes = std::numeric_limits<uint64_t>::max();
+		uint64_t previousScoreNs = std::numeric_limits<uint64_t>::max();
+		uint64_t previousQueueBytes = 0;
+		uint64_t previousTxBytes = 0;
+		uint32_t candidateCount = 0;
+		for (uint32_t offset = 0; offset < nexthops.size(); ++offset) {
+			const int candidate = nexthops[(start + offset) % nexthops.size()];
+			if (candidate < 0 ||
+				static_cast<uint32_t>(candidate) >= GetNDevices() ||
+				!m_devices[candidate]->IsLinkUp()) {
+				continue;
+			}
+			Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[candidate]);
+			uint64_t scoreNs = 0;
+			uint64_t queueBytes = 0;
+			uint64_t propagationNs = 0;
+			if (!SwitchNode::MeasureFlowletPort(
+					device, p == nullptr ? 0 : p->GetSize(),
+					&scoreNs, &queueBytes, &propagationNs)) {
+				continue;
+			}
+			++candidateCount;
+			const uint64_t txBytes =
+				static_cast<uint32_t>(candidate) < pCnt ? m_txBytes[candidate] : 0;
+			if (candidate == previousDev) {
+				previousScoreNs = scoreNs;
+				previousQueueBytes = queueBytes;
+				previousTxBytes = txBytes;
+			}
+			if (scoreNs < bestScoreNs ||
+				(scoreNs == bestScoreNs && txBytes < bestTxBytes)) {
+				bestDev = candidate;
+				bestScoreNs = scoreNs;
+				bestQueueBytes = queueBytes;
+				bestTxBytes = txBytes;
+			}
+		}
+
+		if (bestDev >= 0) {
+			int selectedDev = bestDev;
+			uint64_t selectedScoreNs = bestScoreNs;
+			uint64_t selectedQueueBytes = bestQueueBytes;
+			uint64_t selectedTxBytes = bestTxBytes;
+			if (previousEligible && bestDev != previousDev &&
+				(previousScoreNs <= bestScoreNs ||
+				 previousScoreNs - bestScoreNs <=
+					SwitchNode::FlowletHysteresisNs())) {
+				selectedDev = previousDev;
+				selectedScoreNs = previousScoreNs;
+				selectedQueueBytes = previousQueueBytes;
+				selectedTxBytes = previousTxBytes;
+			}
+			const bool switched =
+				hasCached && previousDev >= 0 && selectedDev != previousDev;
+			if (!hasCached || switched) {
+				if (switched && static_cast<uint32_t>(previousDev) < pCnt &&
+					m_dynamicPortAssignments[previousDev] > 0) {
+					--m_dynamicPortAssignments[previousDev];
+				}
+				if (static_cast<uint32_t>(selectedDev) < pCnt) {
+					++m_dynamicPortAssignments[selectedDev];
+				}
+			}
+
+			FlowletRouteState& state = m_flowletRoutes[qpKey];
+			state.outDev = selectedDev;
+			state.lastPacketNs = nowNs;
+			state.flowletId = flowletId;
+			if (maxBytes > 0) {
+				const uint64_t chunk = ch.udp.seq / maxBytes;
+				state.nextByteBoundary =
+					chunk >= std::numeric_limits<uint64_t>::max() / maxBytes - 1
+						? std::numeric_limits<uint64_t>::max()
+						: (chunk + 1) * maxBytes;
+			}
+			SwitchNode::RecordFlowletDecisionStats(
+				GetId(),
+				static_cast<uint32_t>(selectedDev),
+				candidateCount,
+				selectedQueueBytes,
+				selectedTxBytes,
+				selectedScoreNs,
+				previousScoreNs == std::numeric_limits<uint64_t>::max()
+					? 0
+					: previousScoreNs,
+				flowletId,
+				nowNs,
+				switched,
+				gapTriggered,
+				byteTriggered,
+				linkTriggered,
+				ch);
+			return selectedDev;
+		}
+	}
+
+	if (SwitchNode::DynamicQpRoutingEnabled() &&
+		!SwitchNode::FlowletRoutingEnabled() &&
+		ch.l3Prot == 0x11 && nexthops.size() > 1) {
+		std::lock_guard<std::mutex> routeGuard(m_dynamicQpRoutesMutex);
+		const QpRouteKey qpKey{
+			ch.sip,
+			ch.dip,
+			ch.udp.sport,
+			ch.udp.dport,
+		};
+		auto cached = m_dynamicQpRoutes.find(qpKey);
+		if (cached != m_dynamicQpRoutes.end()) {
+			const int cachedDev = cached->second;
+			const bool stillEligible =
+				std::find(nexthops.begin(), nexthops.end(), cachedDev) !=
+					nexthops.end() &&
+				cachedDev >= 0 &&
+				static_cast<uint32_t>(cachedDev) < GetNDevices() &&
+				m_devices[cachedDev]->IsLinkUp();
+			if (stillEligible) {
+				return cachedDev;
+			}
+			m_dynamicQpRoutes.erase(cached);
+		}
+
+		const uint32_t start = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
+		int bestDev = -1;
+		uint64_t bestQueueBytes = std::numeric_limits<uint64_t>::max();
+		uint64_t bestAssignments = std::numeric_limits<uint64_t>::max();
+		uint64_t bestTxBytes = std::numeric_limits<uint64_t>::max();
+		uint32_t candidateCount = 0;
+		for (uint32_t offset = 0; offset < nexthops.size(); ++offset) {
+			const int candidate = nexthops[(start + offset) % nexthops.size()];
+			if (candidate < 0 ||
+				static_cast<uint32_t>(candidate) >= GetNDevices() ||
+				!m_devices[candidate]->IsLinkUp()) {
+				continue;
+			}
+			++candidateCount;
+			Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[candidate]);
+			const uint64_t queueBytes =
+				device != nullptr && device->GetQueue() != nullptr
+					? device->GetQueue()->GetNBytesTotal()
+					: 0;
+			const uint64_t assignments =
+				static_cast<uint32_t>(candidate) < pCnt
+					? m_dynamicPortAssignments[candidate]
+					: 0;
+			const uint64_t txBytes =
+				static_cast<uint32_t>(candidate) < pCnt ? m_txBytes[candidate] : 0;
+			const bool better =
+				queueBytes < bestQueueBytes ||
+				(queueBytes == bestQueueBytes && assignments < bestAssignments) ||
+				(queueBytes == bestQueueBytes && assignments == bestAssignments &&
+				 txBytes < bestTxBytes);
+			if (better) {
+				bestDev = candidate;
+				bestQueueBytes = queueBytes;
+				bestAssignments = assignments;
+				bestTxBytes = txBytes;
+			}
+		}
+
+		if (bestDev >= 0) {
+			m_dynamicQpRoutes[qpKey] = bestDev;
+			if (static_cast<uint32_t>(bestDev) < pCnt) {
+				++m_dynamicPortAssignments[bestDev];
+			}
+			SwitchNode::RecordDynamicQpBindingStats(
+				GetId(),
+				static_cast<uint32_t>(bestDev),
+				candidateCount,
+				bestQueueBytes,
+				bestTxBytes,
+				bestAssignments,
+				ch);
+			return bestDev;
+		}
+	}
 
 	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
 	return nexthops[idx];
@@ -99,12 +345,19 @@ void NVSwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 			if (m_mmu->CheckIngressAdmission(inDev, qIndex, p->GetSize()) && m_mmu->CheckEgressAdmission(idx, qIndex, p->GetSize())){			// Admission control
 				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
-			}else{
-				return; // Drop
+				}else{
+					return; // Drop
+				}
 			}
-		}
-		m_bytes[inDev][idx][qIndex] += p->GetSize();
-		m_devices[idx]->SwitchSend(qIndex, p, ch);
+			auto entry = m_rtTable.find(ch.dip);
+			const uint32_t nextHopCount =
+				entry == m_rtTable.end()
+					? 0
+					: static_cast<uint32_t>(entry->second.size());
+			SwitchNode::RecordRouteChoiceStats(
+				GetId(), GetNodeType(), inDev, idx, ch, p->GetSize(), nextHopCount);
+			m_bytes[inDev][idx][qIndex] += p->GetSize();
+			m_devices[idx]->SwitchSend(qIndex, p, ch);
 	}else
 	{
 		return; // Drop
@@ -160,6 +413,31 @@ void NVSwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx){
 
 void NVSwitchNode::ClearTable(){
 	m_rtTable.clear();
+}
+
+const std::vector<int>* NVSwitchNode::GetRouteNextHops(uint32_t dip) const {
+	auto entry = m_rtTable.find(dip);
+	return entry == m_rtTable.end() ? nullptr : &entry->second;
+}
+
+void NVSwitchNode::BindPathAwareQpRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint32_t outDev) {
+	std::lock_guard<std::mutex> guard(m_dynamicQpRoutesMutex);
+	m_dynamicQpRoutes[QpRouteKey{sip, dip, sport, dport}] =
+		static_cast<int>(outDev);
+}
+
+void NVSwitchNode::UnbindPathAwareQpRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport) {
+	std::lock_guard<std::mutex> guard(m_dynamicQpRoutesMutex);
+	m_dynamicQpRoutes.erase(QpRouteKey{sip, dip, sport, dport});
 }
 
 // This function can only be called in switch mode

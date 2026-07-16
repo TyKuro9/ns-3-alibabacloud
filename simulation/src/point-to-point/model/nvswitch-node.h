@@ -1,6 +1,9 @@
 #ifndef NVSWITCH_NODE_H
 #define NVSWITCH_NODE_H
 
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
 #include <unordered_map>
 #include <ns3/node.h>
 #include "qbb-net-device.h"
@@ -12,10 +15,46 @@ namespace ns3 {
 class Packet;
 
 class NVSwitchNode : public Node{
+	struct QpRouteKey {
+		uint32_t sip;
+		uint32_t dip;
+		uint16_t sport;
+		uint16_t dport;
+
+		bool operator==(const QpRouteKey& other) const {
+			return sip == other.sip && dip == other.dip &&
+				sport == other.sport && dport == other.dport;
+		}
+	};
+
+	struct QpRouteKeyHash {
+		std::size_t operator()(const QpRouteKey& key) const {
+			std::size_t hash = key.sip;
+			hash ^= static_cast<std::size_t>(key.dip) + 0x9e3779b9U +
+				(hash << 6) + (hash >> 2);
+			hash ^= static_cast<std::size_t>(key.sport) + 0x9e3779b9U +
+				(hash << 6) + (hash >> 2);
+			hash ^= static_cast<std::size_t>(key.dport) + 0x9e3779b9U +
+				(hash << 6) + (hash >> 2);
+			return hash;
+		}
+	};
+
+	struct FlowletRouteState {
+		int outDev = -1;
+		uint64_t lastPacketNs = 0;
+		uint64_t nextByteBoundary = 0;
+		uint64_t flowletId = 0;
+	};
+
 	static const uint32_t pCnt = 1025;	// Number of ports used
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used
 	uint32_t m_ecmpSeed;
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
+	std::unordered_map<QpRouteKey, int, QpRouteKeyHash> m_dynamicQpRoutes;
+	std::unordered_map<QpRouteKey, FlowletRouteState, QpRouteKeyHash> m_flowletRoutes;
+	std::mutex m_dynamicQpRoutesMutex;
+	uint64_t m_dynamicPortAssignments[pCnt];
 
 	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
 	
@@ -41,6 +80,18 @@ public:
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();
+	const std::vector<int>* GetRouteNextHops(uint32_t dip) const;
+	void BindPathAwareQpRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint32_t outDev);
+	void UnbindPathAwareQpRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport);
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
 

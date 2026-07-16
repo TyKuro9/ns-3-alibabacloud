@@ -207,6 +207,8 @@ public:
 	// callback for sent a packet
 	typedef Callback<void, Ptr<RdmaQueuePair>, Ptr<Packet>, Time> RdmaPktSent;
 	RdmaPktSent m_rdmaPktSent;
+	typedef Callback<uint32_t, Ptr<RdmaQueuePair>, uint32_t> RdmaSelectTxNic;
+	RdmaSelectTxNic m_rdmaSelectTxNic;
   Callback<void, uint32_t, uint64_t> m_rdmaUpdateTxBytes;
 
 	Ptr<RdmaEgressQueue> GetRdmaQueue();

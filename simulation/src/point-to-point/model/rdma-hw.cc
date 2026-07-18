@@ -44,6 +44,10 @@ struct PathAwareCandidate {
 	std::vector<Ptr<QbbNetDevice>> hops;
 };
 
+Ptr<QbbNetDevice> GetPeerDevice(
+	Ptr<QbbNetDevice> device,
+	Ptr<QbbChannel>* channelOut);
+
 std::unordered_map<uint64_t, uint64_t>& PathReservedBytes() {
 	static std::unordered_map<uint64_t, uint64_t> reservations;
 	return reservations;
@@ -57,6 +61,27 @@ std::mutex& PathReservationMutex() {
 uint64_t PathEdgeKey(Ptr<QbbNetDevice> device) {
 	return (static_cast<uint64_t>(device->GetNode()->GetId()) << 32) |
 		static_cast<uint64_t>(device->GetIfIndex());
+}
+
+uint64_t PathSignature(const PathAwareCandidate& path) {
+	uint64_t signature = 1469598103934665603ULL;
+	for (const Ptr<QbbNetDevice>& device : path.hops) {
+		signature ^= PathEdgeKey(device);
+		signature *= 1099511628211ULL;
+	}
+	return signature;
+}
+
+int32_t PathDestinationNicIndex(const PathAwareCandidate& path) {
+	if (path.hops.empty()) {
+		return -1;
+	}
+	Ptr<QbbNetDevice> peer = GetPeerDevice(path.hops.back(), nullptr);
+	if (peer == nullptr || peer->GetNode() == nullptr ||
+		peer->GetNode()->GetNodeType() != 0) {
+		return -1;
+	}
+	return static_cast<int32_t>(peer->GetIfIndex());
 }
 
 uint64_t SaturatingNs(long double value) {
@@ -405,15 +430,26 @@ bool BuildAdaptiveDualTablePath(
 	}
 
 	PathAwareCandidate best;
+	PathAwareCandidate bestCanonical;
 	long double bestScore = std::numeric_limits<long double>::infinity();
+	long double bestCanonicalScore =
+		std::numeric_limits<long double>::infinity();
 	auto consider = [&](PathAwareCandidate path) {
 		if (!path.valid) {
 			return;
 		}
 		const long double score = PathScoreNs(path, qpBytes, true);
 		if (score < bestScore) {
-			best = std::move(path);
+			best = path;
 			bestScore = score;
+		}
+		// In Zcube the canonical endpoint pairings are either direct (two
+		// host-facing links) or same-partition via a relay (four links). The
+		// odd three-link path is a useful failure fallback, but selecting it
+		// merely to balance one endpoint can sacrifice both path families.
+		if (path.hops.size() % 2 == 0 && score < bestCanonicalScore) {
+			bestCanonical = std::move(path);
+			bestCanonicalScore = score;
 		}
 	};
 
@@ -495,6 +531,10 @@ bool BuildAdaptiveDualTablePath(
 		}
 	}
 
+	if (SwitchNode::DynamicChunkRoutingEnabled() && bestCanonical.valid) {
+		*result = std::move(bestCanonical);
+		return true;
+	}
 	if (!best.valid) {
 		return false;
 	}
@@ -561,7 +601,7 @@ void BindPathAwareRoute(
 	qp->m_pathReservationBytes = reservationBytes;
 }
 
-void ReleasePathAwareRouteLocked(Ptr<RdmaQueuePair> qp) {
+void ReleasePathAwareReservationBytesLocked(Ptr<RdmaQueuePair> qp) {
 	if (qp == nullptr || qp->m_pathReservationEdges.empty()) {
 		return;
 	}
@@ -574,6 +614,16 @@ void ReleasePathAwareRouteLocked(Ptr<RdmaQueuePair> qp) {
 				reservation->second -= qp->m_pathReservationBytes;
 			}
 		}
+	}
+	qp->m_pathReservationBytes = 0;
+}
+
+void ReleasePathAwareRouteLocked(Ptr<RdmaQueuePair> qp) {
+	if (qp == nullptr || qp->m_pathReservationEdges.empty()) {
+		return;
+	}
+	ReleasePathAwareReservationBytesLocked(qp);
+	for (const uint64_t edge : qp->m_pathReservationEdges) {
 
 		const uint32_t nodeId = static_cast<uint32_t>(edge >> 32);
 		Ptr<Node> node = NodeList::GetNode(nodeId);
@@ -589,7 +639,6 @@ void ReleasePathAwareRouteLocked(Ptr<RdmaQueuePair> qp) {
 		}
 	}
 	qp->m_pathReservationEdges.clear();
-	qp->m_pathReservationBytes = 0;
 }
 
 void ReleasePathAwareRoute(Ptr<RdmaQueuePair> qp) {
@@ -890,6 +939,8 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 	uint64_t selectedPathPropagationNs = 0;
 	uint64_t selectedPathReservedBytes = 0;
 	uint32_t selectedPathHops = 0;
+	uint64_t selectedPathSignature = 0;
+	int32_t selectedDestinationNic = -1;
 
 	if (pathAwarePolicy) {
 		std::lock_guard<std::mutex> guard(PathReservationMutex());
@@ -897,7 +948,13 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 		PathAwareCandidate bestPath;
 		long double bestScore = std::numeric_limits<long double>::infinity();
 		viableCandidates = 0;
-		const uint32_t start = qp->GetHash() % v.size();
+		const bool hasSourceNicHint =
+			SwitchNode::DynamicChunkRoutingEnabled() &&
+			qp->m_sourceNicOrdinalHint !=
+				std::numeric_limits<uint32_t>::max();
+		const uint32_t start = hasSourceNicHint
+			? qp->m_sourceNicOrdinalHint % v.size()
+			: qp->GetHash() % v.size();
 		for (uint32_t offset = 0; offset < v.size(); ++offset) {
 			const int candidate = v[(start + offset) % v.size()];
 			if (candidate < 0 ||
@@ -929,6 +986,10 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 				bestPath = std::move(path);
 				bestScore = score;
 			}
+			if (hasSourceNicHint) {
+				qp->m_sourceNicHintFallback = offset != 0;
+				break;
+			}
 		}
 
 		if (pathSelected != std::numeric_limits<uint32_t>::max()) {
@@ -941,6 +1002,8 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 			selectedPathPropagationNs = bestPath.propagationNs;
 			selectedPathReservedBytes = bestPath.reservedBytes;
 			selectedPathHops = static_cast<uint32_t>(bestPath.hops.size());
+			selectedPathSignature = PathSignature(bestPath);
+			selectedDestinationNic = PathDestinationNicIndex(bestPath);
 			BindPathAwareRoute(qp, bestPath, qp->GetBytesLeft());
 			usedPathAware = true;
 		}
@@ -1047,7 +1110,21 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 		selectedTxBytes = selected < tx_bytes.size() ? tx_bytes[selected] : 0;
 	}
 
+	if (qp->m_initialSelectedNicIdx < 0) {
+		qp->m_initialSelectedNicIdx = static_cast<int32_t>(selected);
+	} else if (qp->m_selectedNicIdx >= 0 &&
+		qp->m_selectedNicIdx != static_cast<int32_t>(selected)) {
+		++qp->m_nicReassignments;
+	}
 	qp->m_selectedNicIdx = static_cast<int32_t>(selected);
+	qp->m_selectedDestinationNicIdx = selectedDestinationNic;
+	qp->m_bindCandidateCount = viableCandidates;
+	qp->m_bindPathHops = selectedPathHops;
+	qp->m_bindPathScoreNs = selectedPathScoreNs;
+	qp->m_bindPathQueueDelayNs = selectedPathQueueDelayNs;
+	qp->m_bindPathPropagationNs = selectedPathPropagationNs;
+	qp->m_bindPathReservedBytes = selectedPathReservedBytes;
+	qp->m_bindPathSignature = selectedPathSignature;
 	SwitchNode::RecordSourceQpBindingStats(
 		dynamic || usedPathAware,
 		usedPathAware,
@@ -1255,7 +1332,28 @@ uint32_t RdmaHw::SelectTxNic(
 		}
 	}
 
+	if (qp->m_initialSelectedNicIdx < 0) {
+		qp->m_initialSelectedNicIdx = static_cast<int32_t>(selected);
+	} else if (qp->m_selectedNicIdx >= 0 &&
+		qp->m_selectedNicIdx != static_cast<int32_t>(selected)) {
+		++qp->m_nicReassignments;
+	}
 	qp->m_selectedNicIdx = static_cast<int32_t>(selected);
+	qp->m_selectedDestinationNicIdx = selectedPath.valid
+		? PathDestinationNicIndex(selectedPath)
+		: -1;
+	qp->m_bindCandidateCount = viableCandidates;
+	qp->m_bindPathHops = static_cast<uint32_t>(selectedPath.hops.size());
+	qp->m_bindPathScoreNs = SaturatingNs(selectedScore);
+	qp->m_bindPathQueueDelayNs = SaturatingNs(
+		SwitchNode::AdaptiveZcubeRoutingEnabled()
+			? selectedPath.maxEdgeWorkNs
+			: selectedPath.queueDelayNs);
+	qp->m_bindPathPropagationNs = selectedPath.propagationNs;
+	qp->m_bindPathReservedBytes = selectedPath.reservedBytes;
+	qp->m_bindPathSignature = selectedPath.valid
+		? PathSignature(selectedPath)
+		: 0;
 	qp->m_sourceFlowletInitialized = true;
 	qp->m_sourceFlowletDecisionPending = true;
 	qp->m_sourceFlowletId = flowletId;
@@ -1309,7 +1407,7 @@ Ptr<RdmaQueuePair> RdmaHw::GetQp(uint32_t dip, uint16_t sport, uint16_t pg){
 		return it->second;
 	return NULL;
 }
-void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent){
+void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, uint32_t sourceNicOrdinalHint, Callback<void> notifyAppFinish, Callback<void> notifyAppSent){
 	// create qp
 	Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
 	qp->SetSrc(src);
@@ -1317,6 +1415,7 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	qp->SetTag(tag);
 	qp->SetSize(size);
 	qp->SetInitialSize(size);
+	qp->m_sourceNicOrdinalHint = sourceNicOrdinalHint;
 	qp->SetWin(win);
 	qp->SetBaseRtt(baseRtt);
 	qp->SetVarWin(m_var_win);
@@ -1366,6 +1465,11 @@ void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
 	qp_cnp.erase(key);
 	last_qp_cnp.erase(key);
 	last_qp_rate.erase(key);
+}
+
+void RdmaHw::ReleasePathReservationBytes(Ptr<RdmaQueuePair> qp) {
+	std::lock_guard<std::mutex> guard(PathReservationMutex());
+	ReleasePathAwareReservationBytesLocked(qp);
 }
 
 Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint16_t pg, bool create){
@@ -1584,6 +1688,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (cnp){
 		uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
 		qp_cnp[key]++; // update for the number of cnp this qp has received
+		++qp->m_cnpCount;
 		if (m_cc_mode == 1){ // mlx version
 			cnp_received_mlx(qp);
 		} 

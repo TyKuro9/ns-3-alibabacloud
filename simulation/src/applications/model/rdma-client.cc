@@ -36,6 +36,7 @@
 #include <ns3/rdma-driver.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits>
 
 namespace ns3 {
 
@@ -85,7 +86,13 @@ TypeId RdmaClient::GetTypeId(void) {
                         MakeUintegerChecker<uint64_t>())
           .AddAttribute("NVLS_enable", "NVLS enable info", UintegerValue(0),
                         MakeUintegerAccessor(&RdmaClient::nvls_enable),
-                        MakeUintegerChecker<uint32_t>());
+                        MakeUintegerChecker<uint32_t>())
+          .AddAttribute(
+              "SourceNicOrdinalHint",
+              "Preferred ordinal in the live source-fabric NIC set",
+              UintegerValue(std::numeric_limits<uint32_t>::max()),
+              MakeUintegerAccessor(&RdmaClient::source_nic_ordinal_hint),
+              MakeUintegerChecker<uint32_t>());
   return tid;
 }
 
@@ -133,6 +140,7 @@ void RdmaClient::StartApplication(void) {
   else rdma->DisableNVLS();
   rdma->AddQueuePair(src, dest, tag, m_size, m_pg, m_sip, m_dip, m_sport,
                      m_dport, m_win, m_baseRtt,
+                     source_nic_ordinal_hint,
                      MakeCallback(&RdmaClient::Finish, this),
                      MakeCallback(&RdmaClient::Sent, this));
 }

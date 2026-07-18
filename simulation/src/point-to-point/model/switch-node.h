@@ -127,6 +127,7 @@ public:
 	static bool FlowletRoutingEnabled();
 	static bool DualTableRoutingEnabled();
 	static bool AdaptiveZcubeRoutingEnabled();
+	static bool DynamicChunkRoutingEnabled();
 	static uint64_t FlowletGapNs();
 	static uint64_t FlowletMaxBytes();
 	static uint64_t FlowletHysteresisNs();

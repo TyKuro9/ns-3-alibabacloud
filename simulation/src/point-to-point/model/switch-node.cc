@@ -181,10 +181,18 @@ std::string RoutingPolicyValue() {
 	return normalized;
 }
 
+bool UseDynamicChunkRoutingImpl() {
+	const std::string policy = RoutingPolicyValue();
+	return policy == "spray_dynamic_chunk" ||
+		policy == "dynamic_chunk_spray" || policy == "chunk_spray" ||
+		policy == "chunk_adaptive";
+}
+
 bool UseAdaptiveZcubeRoutingImpl() {
 	const std::string policy = RoutingPolicyValue();
 	return policy == "spray_adaptive" || policy == "adaptive_spray" ||
-		policy == "zcube_adaptive" || policy == "eta_spray";
+		policy == "zcube_adaptive" || policy == "eta_spray" ||
+		UseDynamicChunkRoutingImpl();
 }
 
 bool UseDualTableRoutingImpl() {
@@ -490,7 +498,9 @@ void DumpRouteChoiceStatsImpl(const std::string& path) {
 				isDynamic ? binding->second : emptyBinding;
 			const char* routingMode = "ecmp_hash";
 			if (isDynamic) {
-				if (UseAdaptiveZcubeRoutingImpl()) {
+				if (UseDynamicChunkRoutingImpl()) {
+					routingMode = "dynamic_chunk_qp";
+				} else if (UseAdaptiveZcubeRoutingImpl()) {
 					routingMode = "adaptive_qp";
 				} else if (UseDualTableRoutingImpl()) {
 					routingMode = "dual_table_flowlet";
@@ -1241,6 +1251,10 @@ bool SwitchNode::DualTableRoutingEnabled() {
 
 bool SwitchNode::AdaptiveZcubeRoutingEnabled() {
 	return UseAdaptiveZcubeRoutingImpl();
+}
+
+bool SwitchNode::DynamicChunkRoutingEnabled() {
+	return UseDynamicChunkRoutingImpl();
 }
 
 uint64_t SwitchNode::FlowletGapNs() {

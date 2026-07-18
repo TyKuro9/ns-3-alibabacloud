@@ -7,6 +7,7 @@
 #include "ns3/ppp-header.h"
 #include "rdma-queue-pair.h"
 #include <algorithm>
+#include <limits>
 
 namespace ns3 {
 
@@ -32,6 +33,19 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_src = -1;
 	m_dest = -1;
 	m_selectedNicIdx = -1;
+	m_initialSelectedNicIdx = -1;
+	m_selectedDestinationNicIdx = -1;
+	m_sourceNicOrdinalHint = std::numeric_limits<uint32_t>::max();
+	m_sourceNicHintFallback = false;
+	m_bindCandidateCount = 0;
+	m_bindPathHops = 0;
+	m_bindPathScoreNs = 0;
+	m_bindPathQueueDelayNs = 0;
+	m_bindPathPropagationNs = 0;
+	m_bindPathReservedBytes = 0;
+	m_bindPathSignature = 0;
+	m_nicReassignments = 0;
+	m_cnpCount = 0;
 	m_sourceFlowletInitialized = false;
 	m_sourceFlowletDecisionPending = false;
 	m_sourcePacketSent = false;

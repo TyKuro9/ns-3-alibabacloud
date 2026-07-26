@@ -41,6 +41,32 @@ class SwitchNode : public Node{
 		}
 	};
 
+	struct PacketRouteKey {
+		uint32_t sip;
+		uint32_t dip;
+		uint16_t sport;
+		uint16_t dport;
+		uint64_t seq;
+
+		bool operator==(const PacketRouteKey& other) const {
+			return sip == other.sip && dip == other.dip &&
+				sport == other.sport && dport == other.dport &&
+				seq == other.seq;
+		}
+	};
+
+	struct PacketRouteKeyHash {
+		std::size_t operator()(const PacketRouteKey& key) const {
+			std::size_t hash = QpRouteKeyHash()(
+				QpRouteKey{key.sip, key.dip, key.sport, key.dport});
+			hash ^= static_cast<std::size_t>(key.seq) + 0x9e3779b9U +
+				(hash << 6) + (hash >> 2);
+			hash ^= static_cast<std::size_t>(key.seq >> 32) + 0x9e3779b9U +
+				(hash << 6) + (hash >> 2);
+			return hash;
+		}
+	};
+
 	struct FlowletRouteState {
 		int outDev = -1;
 		uint64_t lastPacketNs = 0;
@@ -53,6 +79,7 @@ class SwitchNode : public Node{
 	uint32_t m_ecmpSeed;
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
 	std::unordered_map<QpRouteKey, int, QpRouteKeyHash> m_dynamicQpRoutes;
+	std::unordered_map<PacketRouteKey, int, PacketRouteKeyHash> m_packetDlbRoutes;
 	std::unordered_map<QpRouteKey, FlowletRouteState, QpRouteKeyHash> m_flowletRoutes;
 	std::mutex m_dynamicQpRoutesMutex;
 	uint64_t m_dynamicPortAssignments[pCnt];
@@ -100,6 +127,19 @@ public:
 		uint32_t dip,
 		uint16_t sport,
 		uint16_t dport);
+	void BindPacketDlbRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint64_t seq,
+		uint32_t outDev);
+	void UnbindPacketDlbRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint64_t seq);
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
 
@@ -128,6 +168,7 @@ public:
 	static bool DualTableRoutingEnabled();
 	static bool AdaptiveZcubeRoutingEnabled();
 	static bool DynamicChunkRoutingEnabled();
+	static bool PacketDlbRoutingEnabled();
 	static uint64_t FlowletGapNs();
 	static uint64_t FlowletMaxBytes();
 	static uint64_t FlowletHysteresisNs();
@@ -199,6 +240,13 @@ public:
 		uint16_t sport,
 		uint16_t dport,
 		uint32_t packetBytes);
+	static void RecordPacketDlbReorderEvent(
+		uint32_t packetBytes,
+		uint64_t bufferedBytes,
+		uint64_t drainedPackets,
+		uint64_t drainedBytes,
+		bool duplicate,
+		bool nack);
 	static void RecordSourceQpBindingStats(
 		bool dynamic,
 		bool pathAware,

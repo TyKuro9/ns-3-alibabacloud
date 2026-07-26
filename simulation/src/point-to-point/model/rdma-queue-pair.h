@@ -9,6 +9,7 @@
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace ns3 {
@@ -40,6 +41,12 @@ public:
 	uint64_t m_sourceLastPacketNs;
 	uint64_t m_sourceNextByteBoundary;
 	uint64_t m_sourceFlowletId;
+	bool m_packetDlbPrepared;
+	uint64_t m_packetDlbPreparedSeq;
+	int32_t m_packetDlbPreparedNicIdx;
+	std::vector<uint32_t> m_packetDlbBoundSwitches;
+	std::map<uint64_t, std::vector<uint32_t>>
+		m_packetDlbOutstandingRoutes;
 	std::vector<uint64_t> m_pathReservationEdges;
 	uint64_t m_pathReservationBytes;
 	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
@@ -147,9 +154,12 @@ public:
 	uint16_t sport, dport;
 	uint16_t m_ipid;
 	uint64_t ReceiverNextExpectedSeq;
+	std::map<uint64_t, uint32_t> m_reorderSegments;
+	uint64_t m_reorderBufferedBytes;
+	uint64_t m_reorderPeakBytes;
 	Time m_nackTimer;
 	int32_t m_milestone_rx;
-	uint32_t m_lastNACK;
+	uint64_t m_lastNACK;
 	EventId QcnTimerEvent; // if destroy this rxQp, remember to cancel this timer
 
 	static TypeId GetTypeId (void);

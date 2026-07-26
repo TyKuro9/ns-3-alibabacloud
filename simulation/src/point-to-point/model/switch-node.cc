@@ -134,6 +134,41 @@ std::atomic<uint64_t>& SourceFlowletSwitchCount() {
 	return count;
 }
 
+std::atomic<uint64_t>& PacketDlbOutOfOrderPackets() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbOutOfOrderBytes() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbReorderDrainedPackets() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbReorderDrainedBytes() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbReorderPeakBytes() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbDuplicatePackets() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbReorderNacks() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
 constexpr size_t kPathLengthBuckets = 8;
 
 std::array<std::atomic<uint64_t>, kPathLengthBuckets>& PathBindingCounts() {
@@ -188,11 +223,17 @@ bool UseDynamicChunkRoutingImpl() {
 		policy == "chunk_adaptive";
 }
 
+bool UsePacketDlbRoutingImpl() {
+	const std::string policy = RoutingPolicyValue();
+	return policy == "spray_packet_dlb" || policy == "packet_dlb" ||
+		policy == "packet_spray" || policy == "dlb_spray";
+}
+
 bool UseAdaptiveZcubeRoutingImpl() {
 	const std::string policy = RoutingPolicyValue();
 	return policy == "spray_adaptive" || policy == "adaptive_spray" ||
 		policy == "zcube_adaptive" || policy == "eta_spray" ||
-		UseDynamicChunkRoutingImpl();
+		UseDynamicChunkRoutingImpl() || UsePacketDlbRoutingImpl();
 }
 
 bool UseDualTableRoutingImpl() {
@@ -213,7 +254,8 @@ bool UseFlowletRoutingImpl() {
 	const std::string policy = RoutingPolicyValue();
 	return policy == "spray_flowlet" || policy == "flowlet_spray" ||
 		policy == "dynamic_flowlet" || policy == "flowlet_dynamic" ||
-		(UseDualTableRoutingImpl() && !UseAdaptiveZcubeRoutingImpl());
+		(UseDualTableRoutingImpl() && !UseAdaptiveZcubeRoutingImpl() &&
+		 !UsePacketDlbRoutingImpl());
 }
 
 bool UseDynamicQpRoutingImpl() {
@@ -498,7 +540,9 @@ void DumpRouteChoiceStatsImpl(const std::string& path) {
 				isDynamic ? binding->second : emptyBinding;
 			const char* routingMode = "ecmp_hash";
 			if (isDynamic) {
-				if (UseDynamicChunkRoutingImpl()) {
+				if (UsePacketDlbRoutingImpl()) {
+					routingMode = "packet_dlb";
+				} else if (UseDynamicChunkRoutingImpl()) {
 					routingMode = "dynamic_chunk_qp";
 				} else if (UseAdaptiveZcubeRoutingImpl()) {
 					routingMode = "adaptive_qp";
@@ -512,10 +556,10 @@ void DumpRouteChoiceStatsImpl(const std::string& path) {
 					routingMode = "dynamic_qp";
 				}
 			}
-				fprintf(
-					output,
-					"%08x,%08x,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%s,%u,%lu,%lu,%lu,"
-					"%lu,%lu,%lu,%lu,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+			fprintf(
+				output,
+				"%08x,%08x,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%s,%u,%lu,%lu,%lu,"
+				"%lu,%lu,%lu,%lu,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
 				key.sip,
 				key.dip,
 				key.sport,
@@ -526,26 +570,26 @@ void DumpRouteChoiceStatsImpl(const std::string& path) {
 				key.outDev,
 				stats.nextHopCount,
 				stats.packets,
-					stats.bytes,
-					routingMode,
+				stats.bytes,
+				routingMode,
 				bindingStats.candidateCount,
 				bindingStats.queueBytes,
 				bindingStats.txBytes,
 				bindingStats.priorPortBindings,
 				bindingStats.pathScoreNs,
 				bindingStats.pathQueueDelayNs,
-					bindingStats.pathPropagationNs,
-					bindingStats.pathReservedBytes,
-					bindingStats.pathHops,
-					bindingStats.flowletDecisions,
-					bindingStats.flowletSwitches,
-					bindingStats.flowletGapTriggers,
-					bindingStats.flowletByteTriggers,
-					bindingStats.flowletLinkTriggers,
-					bindingStats.flowletLastId,
-					bindingStats.flowletLastDecisionNs,
-					bindingStats.flowletSelectedScoreNs,
-					bindingStats.flowletPreviousScoreNs);
+				bindingStats.pathPropagationNs,
+				bindingStats.pathReservedBytes,
+				bindingStats.pathHops,
+				bindingStats.flowletDecisions,
+				bindingStats.flowletSwitches,
+				bindingStats.flowletGapTriggers,
+				bindingStats.flowletByteTriggers,
+				bindingStats.flowletLinkTriggers,
+				bindingStats.flowletLastId,
+				bindingStats.flowletLastDecisionNs,
+				bindingStats.flowletSelectedScoreNs,
+				bindingStats.flowletPreviousScoreNs);
 		}
 	}
 	fclose(output);
@@ -651,7 +695,29 @@ SwitchNode::SwitchNode(){
 }
 
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
-	if (DualTableRoutingEnabled() && ch.l3Prot == 0x11) {
+	if (PacketDlbRoutingEnabled() && ch.l3Prot == 0x11) {
+		std::lock_guard<std::mutex> routeGuard(m_dynamicQpRoutesMutex);
+		const PacketRouteKey packetKey{
+			ch.sip,
+			ch.dip,
+			ch.udp.sport,
+			ch.udp.dport,
+			ch.udp.seq,
+		};
+		auto bound = m_packetDlbRoutes.find(packetKey);
+		if (bound != m_packetDlbRoutes.end()) {
+			const int outDev = bound->second;
+			m_packetDlbRoutes.erase(bound);
+			if (outDev >= 0 &&
+				static_cast<uint32_t>(outDev) < GetNDevices() &&
+				m_devices[outDev]->IsLinkUp()) {
+				return outDev;
+			}
+		}
+	}
+
+	if (DualTableRoutingEnabled() && !PacketDlbRoutingEnabled() &&
+		ch.l3Prot == 0x11) {
 		std::lock_guard<std::mutex> routeGuard(m_dynamicQpRoutesMutex);
 		const QpRouteKey qpKey{
 			ch.sip,
@@ -838,6 +904,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	// Dynamic spray binds the first data packet of a QP to the least-loaded
 	// eligible next hop. The cached decision keeps all later packets in order.
 	if (DynamicQpRoutingEnabled() && !FlowletRoutingEnabled() &&
+		!PacketDlbRoutingEnabled() &&
 		ch.l3Prot == 0x11 && nexthops.size() > 1) {
 		std::lock_guard<std::mutex> routeGuard(m_dynamicQpRoutesMutex);
 		const QpRouteKey qpKey{
@@ -913,6 +980,49 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 				bestTxBytes,
 				bestAssignments,
 				ch);
+			return bestDev;
+		}
+	}
+
+	if (PacketDlbRoutingEnabled() && ch.l3Prot == 0x11 &&
+		nexthops.size() > 1) {
+		const uint32_t sequenceSeed =
+			static_cast<uint32_t>(ch.udp.seq) ^
+			static_cast<uint32_t>(ch.udp.seq >> 32) ^ m_ecmpSeed;
+		const uint32_t start =
+			EcmpHash(buf.u8, 12, sequenceSeed) % nexthops.size();
+		int bestDev = -1;
+		uint64_t bestScoreNs = std::numeric_limits<uint64_t>::max();
+		uint64_t bestTxBytes = std::numeric_limits<uint64_t>::max();
+		for (uint32_t offset = 0; offset < nexthops.size(); ++offset) {
+			const int candidate = nexthops[(start + offset) % nexthops.size()];
+			if (candidate < 0 ||
+				static_cast<uint32_t>(candidate) >= GetNDevices() ||
+				!m_devices[candidate]->IsLinkUp()) {
+				continue;
+			}
+			uint64_t scoreNs = 0;
+			uint64_t queueBytes = 0;
+			uint64_t propagationNs = 0;
+			Ptr<QbbNetDevice> device =
+				DynamicCast<QbbNetDevice>(m_devices[candidate]);
+			if (!MeasureFlowletPort(
+					device, p == nullptr ? 0 : p->GetSize(),
+					&scoreNs, &queueBytes, &propagationNs)) {
+				continue;
+			}
+			const uint64_t txBytes =
+				static_cast<uint32_t>(candidate) < pCnt
+					? m_txBytes[candidate]
+					: 0;
+			if (scoreNs < bestScoreNs ||
+				(scoreNs == bestScoreNs && txBytes < bestTxBytes)) {
+				bestDev = candidate;
+				bestScoreNs = scoreNs;
+				bestTxBytes = txBytes;
+			}
+		}
+		if (bestDev >= 0) {
 			return bestDev;
 		}
 	}
@@ -1051,6 +1161,30 @@ void SwitchNode::UnbindPathAwareQpRoute(
 		uint16_t dport) {
 	std::lock_guard<std::mutex> guard(m_dynamicQpRoutesMutex);
 	m_dynamicQpRoutes.erase(QpRouteKey{sip, dip, sport, dport});
+}
+
+void SwitchNode::BindPacketDlbRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint64_t seq,
+		uint32_t outDev) {
+	std::lock_guard<std::mutex> guard(m_dynamicQpRoutesMutex);
+	m_packetDlbRoutes[
+		PacketRouteKey{sip, dip, sport, dport, seq}] =
+		static_cast<int>(outDev);
+}
+
+void SwitchNode::UnbindPacketDlbRoute(
+		uint32_t sip,
+		uint32_t dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint64_t seq) {
+	std::lock_guard<std::mutex> guard(m_dynamicQpRoutesMutex);
+	m_packetDlbRoutes.erase(
+		PacketRouteKey{sip, dip, sport, dport, seq});
 }
 
 // This function can only be called in switch mode
@@ -1257,6 +1391,10 @@ bool SwitchNode::DynamicChunkRoutingEnabled() {
 	return UseDynamicChunkRoutingImpl();
 }
 
+bool SwitchNode::PacketDlbRoutingEnabled() {
+	return UsePacketDlbRoutingImpl();
+}
+
 uint64_t SwitchNode::FlowletGapNs() {
 	return FlowletGapNsImpl();
 }
@@ -1448,6 +1586,38 @@ void SwitchNode::RecordSourceFlowletPacketStats(
 	stats.nodeType = 0;
 }
 
+void SwitchNode::RecordPacketDlbReorderEvent(
+		uint32_t packetBytes,
+		uint64_t bufferedBytes,
+		uint64_t drainedPackets,
+		uint64_t drainedBytes,
+		bool duplicate,
+		bool nack) {
+	if (packetBytes > 0) {
+		PacketDlbOutOfOrderPackets().fetch_add(1, std::memory_order_relaxed);
+		PacketDlbOutOfOrderBytes().fetch_add(
+			packetBytes, std::memory_order_relaxed);
+	}
+	if (drainedPackets > 0) {
+		PacketDlbReorderDrainedPackets().fetch_add(
+			drainedPackets, std::memory_order_relaxed);
+		PacketDlbReorderDrainedBytes().fetch_add(
+			drainedBytes, std::memory_order_relaxed);
+	}
+	uint64_t peak =
+		PacketDlbReorderPeakBytes().load(std::memory_order_relaxed);
+	while (bufferedBytes > peak &&
+		!PacketDlbReorderPeakBytes().compare_exchange_weak(
+			peak, bufferedBytes, std::memory_order_relaxed)) {
+	}
+	if (duplicate) {
+		PacketDlbDuplicatePackets().fetch_add(1, std::memory_order_relaxed);
+	}
+	if (nack) {
+		PacketDlbReorderNacks().fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void SwitchNode::RecordSourceQpBindingStats(
 		bool dynamic,
 		bool pathAware,
@@ -1492,7 +1662,7 @@ void SwitchNode::RecordSourceQpBindingStats(
 			pathReservedBytes,
 			pathHops);
 	}
-	if (FlowletRoutingEnabled()) {
+	if (FlowletRoutingEnabled() || PacketDlbRoutingEnabled()) {
 		return;
 	}
 	if (RouteChoiceOutputPath().empty()) {
@@ -1544,14 +1714,16 @@ void SwitchNode::PrintFlowletRoutingSummary() {
 			std::cout << std::endl;
 		}
 	}
-	if (!FlowletRoutingEnabled()) {
+	if (!FlowletRoutingEnabled() && !PacketDlbRoutingEnabled()) {
 		return;
 	}
 	static std::atomic<bool> printed{false};
 	if (printed.exchange(true)) {
 		return;
 	}
-	std::cout << "[NS3 FLOWLET SUMMARY] decisions="
+	std::cout << (PacketDlbRoutingEnabled()
+			? "[NS3 PACKET DLB SUMMARY] decisions="
+			: "[NS3 FLOWLET SUMMARY] decisions=")
 		<< FlowletDecisionCount().load(std::memory_order_relaxed)
 		<< " switches="
 		<< FlowletSwitchCount().load(std::memory_order_relaxed)
@@ -1568,7 +1740,26 @@ void SwitchNode::PrintFlowletRoutingSummary() {
 		<< SourceFlowletDecisionCount().load(std::memory_order_relaxed)
 		<< " source_switches="
 		<< SourceFlowletSwitchCount().load(std::memory_order_relaxed)
-		<< std::endl;
+		;
+	if (PacketDlbRoutingEnabled()) {
+		std::cout << " reordered_packets="
+			<< PacketDlbOutOfOrderPackets().load(std::memory_order_relaxed)
+			<< " reordered_bytes="
+			<< PacketDlbOutOfOrderBytes().load(std::memory_order_relaxed)
+			<< " reorder_drained_packets="
+			<< PacketDlbReorderDrainedPackets().load(
+				std::memory_order_relaxed)
+			<< " reorder_drained_bytes="
+			<< PacketDlbReorderDrainedBytes().load(
+				std::memory_order_relaxed)
+			<< " reorder_peak_bytes="
+			<< PacketDlbReorderPeakBytes().load(std::memory_order_relaxed)
+			<< " duplicate_packets="
+			<< PacketDlbDuplicatePackets().load(std::memory_order_relaxed)
+			<< " reorder_nacks="
+			<< PacketDlbReorderNacks().load(std::memory_order_relaxed);
+	}
+	std::cout << std::endl;
 }
 
 } /* namespace ns3 */

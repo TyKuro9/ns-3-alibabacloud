@@ -52,6 +52,9 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_sourceLastPacketNs = 0;
 	m_sourceNextByteBoundary = 0;
 	m_sourceFlowletId = 0;
+	m_packetDlbPrepared = false;
+	m_packetDlbPreparedSeq = 0;
+	m_packetDlbPreparedNicIdx = -1;
 	m_pathReservationBytes = 0;
 	m_tag = -1;
 	snd_nxt = snd_una = 0;
@@ -234,6 +237,8 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	sip = dip = sport = dport = 0;
 	m_ipid = 0;
 	ReceiverNextExpectedSeq = 0;
+	m_reorderBufferedBytes = 0;
+	m_reorderPeakBytes = 0;
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;

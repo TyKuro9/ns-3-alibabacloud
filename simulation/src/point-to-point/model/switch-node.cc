@@ -201,7 +201,7 @@ std::mutex& RouteDumpMutex() {
 	return mutex;
 }
 
-std::string RoutingPolicyValue() {
+const std::string& RoutingPolicyValue() {
 	static const std::string normalized = []() {
 		const char* value = std::getenv("AS_NS3_ROUTING_POLICY");
 		if (value == nullptr || value[0] == '\0') {
@@ -216,42 +216,58 @@ std::string RoutingPolicyValue() {
 	return normalized;
 }
 
+bool UseDisjointChunkRoutingImpl() {
+	const std::string& policy = RoutingPolicyValue();
+	return policy == "spray_disjoint_chunk" ||
+		policy == "disjoint_chunk_spray" ||
+		policy == "zcube_disjoint_chunk" ||
+		policy == "spray_dynamic_pair";
+}
+
 bool UseDynamicChunkRoutingImpl() {
-	const std::string policy = RoutingPolicyValue();
+	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_dynamic_chunk" ||
 		policy == "dynamic_chunk_spray" || policy == "chunk_spray" ||
-		policy == "chunk_adaptive";
+		policy == "chunk_adaptive" || UseDisjointChunkRoutingImpl();
 }
 
 bool UsePacketDlbRoutingImpl() {
-	const std::string policy = RoutingPolicyValue();
+	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_packet_dlb" || policy == "packet_dlb" ||
 		policy == "packet_spray" || policy == "dlb_spray";
 }
 
+bool UseMultiQpPacketDlbRoutingImpl() {
+	const std::string& policy = RoutingPolicyValue();
+	return policy == "spray_multi_qp_dlb" ||
+		policy == "multi_qp_packet_dlb" ||
+		policy == "packet_dlb_multi_qp" ||
+		policy == "realistic_packet_dlb";
+}
+
 bool UseAdaptiveZcubeRoutingImpl() {
-	const std::string policy = RoutingPolicyValue();
+	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_adaptive" || policy == "adaptive_spray" ||
 		policy == "zcube_adaptive" || policy == "eta_spray" ||
 		UseDynamicChunkRoutingImpl() || UsePacketDlbRoutingImpl();
 }
 
 bool UseDualTableRoutingImpl() {
-	const std::string policy = RoutingPolicyValue();
+	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_dual_table" || policy == "dual_table_spray" ||
 		policy == "dual_table_flowlet" || policy == "zcube_dual_table" ||
 		UseAdaptiveZcubeRoutingImpl();
 }
 
 bool UsePathAwareQpRoutingImpl() {
-	const std::string policy = RoutingPolicyValue();
+	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_path" || policy == "spray_path_aware" ||
 		policy == "path_aware" || policy == "qp_path" ||
 		UseDualTableRoutingImpl();
 }
 
 bool UseFlowletRoutingImpl() {
-	const std::string policy = RoutingPolicyValue();
+	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_flowlet" || policy == "flowlet_spray" ||
 		policy == "dynamic_flowlet" || policy == "flowlet_dynamic" ||
 		(UseDualTableRoutingImpl() && !UseAdaptiveZcubeRoutingImpl() &&
@@ -259,7 +275,7 @@ bool UseFlowletRoutingImpl() {
 }
 
 bool UseDynamicQpRoutingImpl() {
-	const std::string policy = RoutingPolicyValue();
+	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_dynamic" || policy == "dynamic_spray" ||
 		policy == "qp_dynamic" || policy == "dynamic_qp" ||
 		UsePathAwareQpRoutingImpl() || UseFlowletRoutingImpl();
@@ -305,7 +321,16 @@ uint64_t FlowletHysteresisNsImpl() {
 	return value;
 }
 
-std::string RouteChoiceOutputPath();
+const std::string& RouteChoiceOutputPath();
+
+bool RoutingStatsEnabledImpl() {
+	static const bool enabled = []() {
+		const char* value = std::getenv("AS_NS3_ROUTING_STATS");
+		return value == nullptr || value[0] == '\0' ||
+			std::string(value) != "0";
+	}();
+	return enabled;
+}
 
 void RecordDynamicQpBindingRawImpl(
 		uint32_t switchId,
@@ -392,8 +417,11 @@ void RecordFlowletDecisionRawImpl(
 		bool sourceDecision = false,
 		uint64_t pathQueueDelayNs = 0,
 		uint64_t pathPropagationNs = 0,
-		uint64_t pathReservedBytes = 0,
-		uint32_t pathHops = 0) {
+			uint64_t pathReservedBytes = 0,
+			uint32_t pathHops = 0) {
+	if (!RoutingStatsEnabledImpl()) {
+		return;
+	}
 	if (!RouteChoiceOutputPath().empty()) {
 		const DynamicQpBindingKey key{
 			sip,
@@ -483,9 +511,12 @@ void RecordFlowletDecisionImpl(
 		ch.udp.dport);
 }
 
-std::string RouteChoiceOutputPath() {
-	const char* value = std::getenv("AS_NS3_ROUTE_CHOICE_FILE");
-	return value == nullptr ? std::string() : std::string(value);
+const std::string& RouteChoiceOutputPath() {
+	static const std::string path = []() {
+		const char* value = std::getenv("AS_NS3_ROUTE_CHOICE_FILE");
+		return value == nullptr ? std::string() : std::string(value);
+	}();
+	return path;
 }
 
 uint64_t RouteChoiceDumpIntervalMs() {
@@ -538,10 +569,16 @@ void DumpRouteChoiceStatsImpl(const std::string& path) {
 			const DynamicQpBindingStats emptyBinding;
 			const DynamicQpBindingStats& bindingStats =
 				isDynamic ? binding->second : emptyBinding;
-			const char* routingMode = "ecmp_hash";
+			const char* routingMode = UseMultiQpPacketDlbRoutingImpl()
+				? "multi_qp_packet_dlb"
+				: "ecmp_hash";
 			if (isDynamic) {
-				if (UsePacketDlbRoutingImpl()) {
+				if (UseMultiQpPacketDlbRoutingImpl()) {
+					routingMode = "multi_qp_packet_dlb";
+				} else if (UsePacketDlbRoutingImpl()) {
 					routingMode = "packet_dlb";
+				} else if (UseDisjointChunkRoutingImpl()) {
+					routingMode = "disjoint_chunk_qp";
 				} else if (UseDynamicChunkRoutingImpl()) {
 					routingMode = "dynamic_chunk_qp";
 				} else if (UseAdaptiveZcubeRoutingImpl()) {
@@ -695,7 +732,8 @@ SwitchNode::SwitchNode(){
 }
 
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
-	if (PacketDlbRoutingEnabled() && ch.l3Prot == 0x11) {
+	if ((PacketDlbRoutingEnabled() || MultiQpPacketDlbRoutingEnabled()) &&
+		ch.l3Prot == 0x11) {
 		std::lock_guard<std::mutex> routeGuard(m_dynamicQpRoutesMutex);
 		const PacketRouteKey packetKey{
 			ch.sip,
@@ -984,7 +1022,8 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		}
 	}
 
-	if (PacketDlbRoutingEnabled() && ch.l3Prot == 0x11 &&
+	if ((PacketDlbRoutingEnabled() || MultiQpPacketDlbRoutingEnabled()) &&
+		ch.l3Prot == 0x11 &&
 		nexthops.size() > 1) {
 		const uint32_t sequenceSeed =
 			static_cast<uint32_t>(ch.udp.seq) ^
@@ -993,7 +1032,9 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 			EcmpHash(buf.u8, 12, sequenceSeed) % nexthops.size();
 		int bestDev = -1;
 		uint64_t bestScoreNs = std::numeric_limits<uint64_t>::max();
+		uint64_t bestQueueBytes = std::numeric_limits<uint64_t>::max();
 		uint64_t bestTxBytes = std::numeric_limits<uint64_t>::max();
+		uint32_t candidateCount = 0;
 		for (uint32_t offset = 0; offset < nexthops.size(); ++offset) {
 			const int candidate = nexthops[(start + offset) % nexthops.size()];
 			if (candidate < 0 ||
@@ -1011,6 +1052,7 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 					&scoreNs, &queueBytes, &propagationNs)) {
 				continue;
 			}
+			++candidateCount;
 			const uint64_t txBytes =
 				static_cast<uint32_t>(candidate) < pCnt
 					? m_txBytes[candidate]
@@ -1019,10 +1061,26 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 				(scoreNs == bestScoreNs && txBytes < bestTxBytes)) {
 				bestDev = candidate;
 				bestScoreNs = scoreNs;
+				bestQueueBytes = queueBytes;
 				bestTxBytes = txBytes;
 			}
 		}
 		if (bestDev >= 0) {
+			RecordFlowletDecisionStats(
+				GetId(),
+				static_cast<uint32_t>(bestDev),
+				candidateCount,
+				bestQueueBytes,
+				bestTxBytes,
+				bestScoreNs,
+				0,
+				ch.udp.seq,
+				Simulator::Now().GetNanoSeconds(),
+				false,
+				false,
+				false,
+				false,
+				ch);
 			return bestDev;
 		}
 	}
@@ -1391,8 +1449,16 @@ bool SwitchNode::DynamicChunkRoutingEnabled() {
 	return UseDynamicChunkRoutingImpl();
 }
 
+bool SwitchNode::DisjointChunkRoutingEnabled() {
+	return UseDisjointChunkRoutingImpl();
+}
+
 bool SwitchNode::PacketDlbRoutingEnabled() {
 	return UsePacketDlbRoutingImpl();
+}
+
+bool SwitchNode::MultiQpPacketDlbRoutingEnabled() {
+	return UseMultiQpPacketDlbRoutingImpl();
 }
 
 uint64_t SwitchNode::FlowletGapNs() {
@@ -1593,6 +1659,9 @@ void SwitchNode::RecordPacketDlbReorderEvent(
 		uint64_t drainedBytes,
 		bool duplicate,
 		bool nack) {
+	if (!RoutingStatsEnabledImpl()) {
+		return;
+	}
 	if (packetBytes > 0) {
 		PacketDlbOutOfOrderPackets().fetch_add(1, std::memory_order_relaxed);
 		PacketDlbOutOfOrderBytes().fetch_add(
@@ -1714,15 +1783,16 @@ void SwitchNode::PrintFlowletRoutingSummary() {
 			std::cout << std::endl;
 		}
 	}
-	if (!FlowletRoutingEnabled() && !PacketDlbRoutingEnabled()) {
+	if (!FlowletRoutingEnabled() && !PacketDlbRoutingEnabled() &&
+		!MultiQpPacketDlbRoutingEnabled()) {
 		return;
 	}
 	static std::atomic<bool> printed{false};
 	if (printed.exchange(true)) {
 		return;
 	}
-	std::cout << (PacketDlbRoutingEnabled()
-			? "[NS3 PACKET DLB SUMMARY] decisions="
+	std::cout << (PacketDlbRoutingEnabled() || MultiQpPacketDlbRoutingEnabled()
+				? "[NS3 PACKET DLB SUMMARY] decisions="
 			: "[NS3 FLOWLET SUMMARY] decisions=")
 		<< FlowletDecisionCount().load(std::memory_order_relaxed)
 		<< " switches="
@@ -1741,7 +1811,7 @@ void SwitchNode::PrintFlowletRoutingSummary() {
 		<< " source_switches="
 		<< SourceFlowletSwitchCount().load(std::memory_order_relaxed)
 		;
-	if (PacketDlbRoutingEnabled()) {
+	if (PacketDlbRoutingEnabled() || MultiQpPacketDlbRoutingEnabled()) {
 		std::cout << " reordered_packets="
 			<< PacketDlbOutOfOrderPackets().load(std::memory_order_relaxed)
 			<< " reordered_bytes="

@@ -36,6 +36,7 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_initialSelectedNicIdx = -1;
 	m_selectedDestinationNicIdx = -1;
 	m_sourceNicOrdinalHint = std::numeric_limits<uint32_t>::max();
+	m_sourcePathParallelism = 1;
 	m_sourceNicHintFallback = false;
 	m_bindCandidateCount = 0;
 	m_bindPathHops = 0;
@@ -55,6 +56,10 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_packetDlbPrepared = false;
 	m_packetDlbPreparedSeq = 0;
 	m_packetDlbPreparedNicIdx = -1;
+	m_packetDlbCandidatesInitialized = false;
+	m_actualPathWindowInitialized = false;
+	m_actualPathWindowBytes = 0;
+	m_actualPathBaseRttNs = 0;
 	m_pathReservationBytes = 0;
 	m_tag = -1;
 	snd_nxt = snd_una = 0;

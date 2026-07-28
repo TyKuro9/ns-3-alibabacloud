@@ -78,7 +78,7 @@ public:
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp
 	uint32_t SelectTxNic(Ptr<RdmaQueuePair> qp, uint32_t currentNic);
-	void AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, uint32_t sourceNicOrdinalHint, Callback<void> notifyAppFinish, Callback<void> notifyAppSent); // add a new qp (new send)
+	void AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, uint32_t sourceNicOrdinalHint, uint32_t sourcePathParallelism, Callback<void> notifyAppFinish, Callback<void> notifyAppSent); // add a new qp (new send)
 	void ReleasePathReservationBytes(Ptr<RdmaQueuePair> qp);
 	void DeleteQueuePair(Ptr<RdmaQueuePair> qp);
 
@@ -114,7 +114,11 @@ public:
 	void RedistributeQp();
 
 	Ptr<Packet> GetNxtPacket(Ptr<RdmaQueuePair> qp); // get next packet to send, inc snd_nxt
-	void PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap);
+	void PktSent(
+		Ptr<RdmaQueuePair> qp,
+		Ptr<Packet> pkt,
+		Time interframeGap,
+		uint32_t sentNic);
 	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size);
 	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);
 	/******************************

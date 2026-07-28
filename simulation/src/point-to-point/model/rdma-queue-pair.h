@@ -25,6 +25,7 @@ public:
 	int32_t m_initialSelectedNicIdx;
 	int32_t m_selectedDestinationNicIdx;
 	uint32_t m_sourceNicOrdinalHint;
+	uint32_t m_sourcePathParallelism;
 	bool m_sourceNicHintFallback;
 	uint32_t m_bindCandidateCount;
 	uint32_t m_bindPathHops;
@@ -44,6 +45,11 @@ public:
 	bool m_packetDlbPrepared;
 	uint64_t m_packetDlbPreparedSeq;
 	int32_t m_packetDlbPreparedNicIdx;
+	bool m_packetDlbCandidatesInitialized;
+	bool m_actualPathWindowInitialized;
+	uint32_t m_actualPathWindowBytes;
+	uint64_t m_actualPathBaseRttNs;
+	std::vector<int> m_packetDlbCandidates;
 	std::vector<uint32_t> m_packetDlbBoundSwitches;
 	std::map<uint64_t, std::vector<uint32_t>>
 		m_packetDlbOutstandingRoutes;

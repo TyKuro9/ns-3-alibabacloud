@@ -205,7 +205,12 @@ public:
 	typedef Callback<void, Ptr<QbbNetDevice> > RdmaLinkDownCb;
 	RdmaLinkDownCb m_rdmaLinkDownCb;
 	// callback for sent a packet
-	typedef Callback<void, Ptr<RdmaQueuePair>, Ptr<Packet>, Time> RdmaPktSent;
+	typedef Callback<
+		void,
+		Ptr<RdmaQueuePair>,
+		Ptr<Packet>,
+		Time,
+		uint32_t> RdmaPktSent;
 	RdmaPktSent m_rdmaPktSent;
 	typedef Callback<uint32_t, Ptr<RdmaQueuePair>, uint32_t> RdmaSelectTxNic;
 	RdmaSelectTxNic m_rdmaSelectTxNic;

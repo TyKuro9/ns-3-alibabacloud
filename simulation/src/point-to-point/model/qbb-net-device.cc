@@ -348,7 +348,7 @@ namespace ns3 {
 				}
 
 				// update for the next avail time
-				m_rdmaPktSent(lastQp, p, m_tInterframeGap);
+				m_rdmaPktSent(lastQp, p, m_tInterframeGap, m_ifIndex);
 			}else { // no packet to send
 				NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
 				Time t = Simulator::GetMaximumSimulationTime();
@@ -434,7 +434,7 @@ namespace ns3 {
 			}
 
 			// update for the next avail time
-			m_rdmaPktSent(lastQp, p, m_tInterframeGap);
+			m_rdmaPktSent(lastQp, p, m_tInterframeGap, m_ifIndex);
 		}else { // no packet to send
 			NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
 			Time t = Simulator::GetMaximumSimulationTime();

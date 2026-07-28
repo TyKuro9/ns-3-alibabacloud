@@ -85,6 +85,7 @@ private:
   uint64_t dest; 
   uint32_t nvls_enable;
   uint32_t source_nic_ordinal_hint;
+  uint32_t source_path_parallelism;
 };
 
 } // namespace ns3

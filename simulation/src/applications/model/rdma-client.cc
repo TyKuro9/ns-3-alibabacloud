@@ -92,6 +92,12 @@ TypeId RdmaClient::GetTypeId(void) {
               "Preferred ordinal in the live source-fabric NIC set",
               UintegerValue(std::numeric_limits<uint32_t>::max()),
               MakeUintegerAccessor(&RdmaClient::source_nic_ordinal_hint),
+              MakeUintegerChecker<uint32_t>())
+          .AddAttribute(
+              "SourcePathParallelism",
+              "Concurrent QPs sharing the selected disjoint path",
+              UintegerValue(1),
+              MakeUintegerAccessor(&RdmaClient::source_path_parallelism),
               MakeUintegerChecker<uint32_t>());
   return tid;
 }
@@ -141,6 +147,7 @@ void RdmaClient::StartApplication(void) {
   rdma->AddQueuePair(src, dest, tag, m_size, m_pg, m_sip, m_dip, m_sport,
                      m_dport, m_win, m_baseRtt,
                      source_nic_ordinal_hint,
+                     source_path_parallelism,
                      MakeCallback(&RdmaClient::Finish, this),
                      MakeCallback(&RdmaClient::Sent, this));
 }

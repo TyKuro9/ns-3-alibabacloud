@@ -14,16 +14,20 @@
 #include "qbb-header.h"
 #include "cn-header.h"
 #include "nvswitch-node.h"
+#include "packet-dlb-tag.h"
 #include "qbb-channel.h"
 #include "switch-node.h"
 #ifdef NS3_MTP
 #include "ns3/mtp-interface.h"
 #endif
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <iostream>	// debug
 #include <limits>
 #include <map>
@@ -41,6 +45,7 @@ namespace {
 
 constexpr uint32_t kMaxPathAwareHops = 32;
 constexpr uint32_t kMaxPacketDlbPathsPerNic = 64;
+constexpr uint64_t kP2rCapacityPinnedChunkMinBytes = 1ULL << 20;
 
 uint32_t PacketDlbPathSampleWidth() {
 	static const uint32_t width = []() {
@@ -93,6 +98,21 @@ bool PacketDlbTwoFourHopEnabled() {
 	return enabled;
 }
 
+bool PacketDlbSelectiveCreditEnabled() {
+	static const bool enabled = []() {
+		const char* value =
+			std::getenv("AS_NS3_PACKET_DLB_SELECTIVE_CREDIT");
+		if (value == nullptr || value[0] == '\0') {
+			return true;
+		}
+		const std::string configured(value);
+		return configured != "0" && configured != "false" &&
+			configured != "FALSE" && configured != "off" &&
+			configured != "OFF";
+	}();
+	return enabled;
+}
+
 struct PathAwareCandidate {
 	bool valid = false;
 	long double queueDelayNs = 0;
@@ -107,10 +127,6 @@ struct PathAwareCandidate {
 Ptr<QbbNetDevice> GetPeerDevice(
 	Ptr<QbbNetDevice> device,
 	Ptr<QbbChannel>* channelOut);
-bool HasLivePacketDlbPath(
-	Ptr<QbbNetDevice> sourceDevice,
-	uint32_t destinationNode,
-	uint32_t dip);
 
 std::unordered_map<uint64_t, uint64_t>& PathReservedBytes() {
 	static std::unordered_map<uint64_t, uint64_t> reservations;
@@ -120,13 +136,6 @@ std::unordered_map<uint64_t, uint64_t>& PathReservedBytes() {
 std::unordered_map<uint64_t, uint64_t>& PacketDlbVirtualFinishNs() {
 	static std::unordered_map<uint64_t, uint64_t> finishTimes;
 	return finishTimes;
-}
-
-std::unordered_map<uint64_t, uint64_t>& PacketDlbCumulativeEdgeBytes() {
-	// This non-decaying ledger models the tail of all work assigned to an
-	// edge, while PacketDlbVirtualFinishNs models its immediate send queue.
-	static std::unordered_map<uint64_t, uint64_t> selectedBytes;
-	return selectedBytes;
 }
 
 std::mutex& PathReservationMutex() {
@@ -305,33 +314,6 @@ std::vector<int> GetDualTableSourceCandidates(const RdmaHw& hw) {
 	return candidates;
 }
 
-uint64_t GetPacketDlbAggregateSourceBitRate(
-		const RdmaHw& hw,
-		uint32_t destinationNode,
-		uint32_t dip) {
-	uint64_t aggregateBitRate = 0;
-	for (const int candidateValue : GetDualTableSourceCandidates(hw)) {
-		if (candidateValue < 0) {
-			continue;
-		}
-		const uint32_t candidate =
-			static_cast<uint32_t>(candidateValue);
-		if (candidate >= hw.m_nic.size() ||
-			hw.m_nic[candidate].dev == nullptr ||
-			!hw.m_nic[candidate].dev->IsLinkUp()) {
-			continue;
-		}
-		if (!HasLivePacketDlbPath(
-				hw.m_nic[candidate].dev, destinationNode, dip)) {
-			continue;
-		}
-		aggregateBitRate = SaturatingAdd(
-			aggregateBitRate,
-			hw.m_nic[candidate].dev->GetDataRate().GetBitRate());
-	}
-	return aggregateBitRate;
-}
-
 const std::vector<int>* GetRouteNextHops(Ptr<Node> node, uint32_t dip) {
 	if (node->GetNodeType() == 1) {
 		Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(node);
@@ -375,6 +357,40 @@ struct PacketDlbPathCacheKeyHash {
 
 using PacketDlbPathTemplate = std::vector<Ptr<QbbNetDevice>>;
 using PacketDlbPathTemplates = std::vector<PacketDlbPathTemplate>;
+
+bool PacketDlbEndpointPairedPathAllowed(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNode,
+		const PacketDlbPathTemplate& pathTemplate,
+		bool* filterApplied);
+
+uint64_t PacketDlbPathBaseRttNs(
+		const PacketDlbPathTemplate& pathTemplate,
+		uint64_t packetBytes) {
+	uint64_t propagationNs = 0;
+	uint64_t serializationNs = 0;
+	for (const Ptr<QbbNetDevice>& device : pathTemplate) {
+		if (device == nullptr || !device->IsLinkUp()) {
+			return 0;
+		}
+		const uint64_t bitRate = device->GetDataRate().GetBitRate();
+		if (bitRate == 0) {
+			return 0;
+		}
+		Ptr<QbbChannel> channel =
+			DynamicCast<QbbChannel>(device->GetChannel());
+		if (channel == nullptr) {
+			return 0;
+		}
+		propagationNs = SaturatingAdd(
+			propagationNs, channel->GetDelay().GetNanoSeconds());
+		serializationNs = SaturatingAdd(
+			serializationNs, SerializationNs(packetBytes, bitRate));
+	}
+	return SaturatingAdd(
+		SaturatingAdd(propagationNs, propagationNs),
+		serializationNs);
+}
 
 struct PacketDlbPathStatsKey {
 	uint32_t sourceGpu = 0;
@@ -575,6 +591,37 @@ void DumpPacketDlbPathStats(const std::string& path) {
 	}
 }
 
+std::atomic<bool>& PacketDlbPathStatsStopRequested() {
+	static auto* requested = new std::atomic<bool>(false);
+	return *requested;
+}
+
+std::condition_variable& PacketDlbPathStatsWakeup() {
+	static auto* wakeup = new std::condition_variable;
+	return *wakeup;
+}
+
+std::mutex& PacketDlbPathStatsWaitMutex() {
+	static auto* mutex = new std::mutex;
+	return *mutex;
+}
+
+std::thread& PacketDlbPathStatsThread() {
+	static auto* thread = new std::thread;
+	return *thread;
+}
+
+void StopPacketDlbPathStatsAutoDump() {
+	PacketDlbPathStatsStopRequested().store(
+		true, std::memory_order_release);
+	PacketDlbPathStatsWakeup().notify_all();
+	std::thread& thread = PacketDlbPathStatsThread();
+	if (thread.joinable() &&
+		thread.get_id() != std::this_thread::get_id()) {
+		thread.join();
+	}
+}
+
 void StartPacketDlbPathStatsAutoDump() {
 	static std::once_flag once;
 	std::call_once(once, []() {
@@ -582,14 +629,39 @@ void StartPacketDlbPathStatsAutoDump() {
 		if (path.empty()) {
 			return;
 		}
-		std::thread([path]() {
+		// These objects must outlive the atexit hook that joins the worker.
+		PacketDlbPathStatsTable();
+		PacketDlbPathStatsMutex();
+		PacketDlbPathStatsStopRequested().store(
+			false, std::memory_order_release);
+		if (std::atexit(StopPacketDlbPathStatsAutoDump) != 0) {
+			return;
+		}
+		PacketDlbPathStatsThread() = std::thread([path]() {
 			const auto interval = std::chrono::milliseconds(
 				PacketDlbPathStatsDumpIntervalMs());
-			while (true) {
-				std::this_thread::sleep_for(interval);
+			std::unique_lock<std::mutex> lock(
+				PacketDlbPathStatsWaitMutex());
+			while (!PacketDlbPathStatsStopRequested().load(
+					std::memory_order_acquire)) {
+				const bool stopping =
+					PacketDlbPathStatsWakeup().wait_for(
+						lock,
+						interval,
+						[]() {
+							return PacketDlbPathStatsStopRequested().load(
+								std::memory_order_acquire);
+						});
+				if (stopping) {
+					break;
+				}
+				lock.unlock();
 				DumpPacketDlbPathStats(path);
+				lock.lock();
 			}
-		}).detach();
+			lock.unlock();
+			DumpPacketDlbPathStats(path);
+		});
 	});
 }
 
@@ -882,23 +954,89 @@ const PacketDlbPathTemplates& GetPacketDlbPathTemplates(
 	return PacketDlbPathCache().emplace(key, std::move(paths)).first->second;
 }
 
-bool HasLivePacketDlbPath(
-		Ptr<QbbNetDevice> sourceDevice,
-		uint32_t destinationNode,
-		uint32_t dip) {
-	const PacketDlbPathTemplates& paths = GetPacketDlbPathTemplates(
-		sourceDevice, destinationNode, dip);
-	for (const PacketDlbPathTemplate& path : paths) {
-		if (std::all_of(
-				path.begin(),
-				path.end(),
-				[](const Ptr<QbbNetDevice>& device) {
-					return device != nullptr && device->IsLinkUp();
-				})) {
-			return true;
-		}
+bool PacketDlbPathMatchesConfiguredHopMode(
+		const PacketDlbPathTemplate& pathTemplate) {
+	if (PacketDlbBalancedThreeHopEnabled()) {
+		return pathTemplate.size() == 3;
 	}
-	return false;
+	if (PacketDlbTwoFourHopEnabled()) {
+		return pathTemplate.size() == 2 || pathTemplate.size() == 4;
+	}
+	return true;
+}
+
+struct PacketDlbAggregateTransport {
+	uint64_t bitRate = 0;
+	uint64_t windowBytes = 0;
+	uint64_t maximumRttNs = 0;
+	std::unordered_map<uint32_t, uint64_t> laneWindowBytes;
+};
+
+PacketDlbAggregateTransport GetPacketDlbAggregateTransport(
+		const RdmaHw& hw,
+		uint32_t destinationNode,
+		uint32_t dip,
+		uint64_t packetBytes) {
+	PacketDlbAggregateTransport aggregate;
+	for (const int candidateValue : GetDualTableSourceCandidates(hw)) {
+		if (candidateValue < 0) {
+			continue;
+		}
+		const uint32_t candidate =
+			static_cast<uint32_t>(candidateValue);
+		if (candidate >= hw.m_nic.size() ||
+			hw.m_nic[candidate].dev == nullptr ||
+			!hw.m_nic[candidate].dev->IsLinkUp()) {
+			continue;
+		}
+		Ptr<QbbNetDevice> sourceDevice = hw.m_nic[candidate].dev;
+		const PacketDlbPathTemplates& paths = GetPacketDlbPathTemplates(
+			sourceDevice, destinationNode, dip);
+		uint64_t laneRttNs = 0;
+		for (const PacketDlbPathTemplate& pathTemplate : paths) {
+			if (!PacketDlbPathMatchesConfiguredHopMode(pathTemplate)) {
+				continue;
+			}
+			bool endpointFilterApplied = false;
+			if (!PacketDlbEndpointPairedPathAllowed(
+					sourceDevice,
+					destinationNode,
+					pathTemplate,
+					&endpointFilterApplied)) {
+				continue;
+			}
+			laneRttNs = std::max(
+				laneRttNs,
+				PacketDlbPathBaseRttNs(pathTemplate, packetBytes));
+		}
+		if (laneRttNs == 0) {
+			for (const PacketDlbPathTemplate& pathTemplate : paths) {
+				laneRttNs = std::max(
+					laneRttNs,
+					PacketDlbPathBaseRttNs(pathTemplate, packetBytes));
+			}
+		}
+		if (laneRttNs == 0) {
+			continue;
+		}
+
+		const uint64_t laneBitRate =
+			sourceDevice->GetDataRate().GetBitRate();
+		aggregate.bitRate = SaturatingAdd(
+			aggregate.bitRate, laneBitRate);
+		aggregate.maximumRttNs = std::max(
+			aggregate.maximumRttNs, laneRttNs);
+		const long double laneBdp =
+			static_cast<long double>(laneRttNs) *
+			static_cast<long double>(laneBitRate) /
+			8.0L / 1000000000.0L;
+		const uint64_t laneWindowBytes =
+			SaturatingNs(std::ceil(laneBdp));
+		aggregate.laneWindowBytes[candidate] = laneWindowBytes;
+		aggregate.windowBytes = SaturatingAdd(
+			aggregate.windowBytes, laneWindowBytes);
+	}
+	return aggregate;
 }
 
 bool EvaluatePacketDlbPath(
@@ -964,18 +1102,20 @@ void ApplyActualPathWindow(
 	qp->m_actualPathWindowInitialized = true;
 	qp->m_actualPathWindowBytes = actualWindowBytes;
 	qp->m_actualPathBaseRttNs = actualRttNs;
+	qp->m_actualPathBottleneckBps = path.bottleneckBps;
 }
 
 bool SchedulePacketDlbPath(
 		const std::vector<Ptr<QbbNetDevice>>& path,
 		uint64_t packetBytes,
+		uint64_t earliestStartNs,
 		bool reserve,
 		uint64_t* arrivalNs) {
 	if (path.empty() || packetBytes == 0 || arrivalNs == nullptr) {
 		return false;
 	}
-	uint64_t cursorNs = Simulator::Now().GetNanoSeconds();
-	const uint64_t nowNs = cursorNs;
+	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+	uint64_t cursorNs = std::max(nowNs, earliestStartNs);
 	for (const Ptr<QbbNetDevice>& device : path) {
 		if (device == nullptr || !device->IsLinkUp()) {
 			return false;
@@ -1022,58 +1162,88 @@ bool SchedulePacketDlbPath(
 bool ProjectPacketDlbArrivalNs(
 		const PacketDlbPathTemplate& pathTemplate,
 		uint64_t packetBytes,
+		uint64_t earliestStartNs,
 		uint64_t* arrivalNs) {
 	return SchedulePacketDlbPath(
-		pathTemplate, packetBytes, false, arrivalNs);
+		pathTemplate, packetBytes, earliestStartNs, false, arrivalNs);
 }
 
-long double PacketDlbCumulativePathWorkNs(
+uint64_t PacketDlbQpPathTailNs(
+		Ptr<RdmaQueuePair> qp,
 		const PacketDlbPathTemplate& pathTemplate,
 		uint64_t packetBytes) {
-	long double maximumWorkNs = 0;
+	if (qp == nullptr || pathTemplate.empty() || packetBytes == 0) {
+		return std::numeric_limits<uint64_t>::max();
+	}
+	uint64_t propagationNs = 0;
+	uint64_t onePacketSerializationNs = 0;
+	uint64_t slowestPacketSerializationNs = 0;
+	uint64_t assignedEdgeTailNs = 0;
 	for (const Ptr<QbbNetDevice>& device : pathTemplate) {
 		if (device == nullptr || !device->IsLinkUp()) {
-			return std::numeric_limits<long double>::infinity();
+			return std::numeric_limits<uint64_t>::max();
 		}
 		const uint64_t bitRate = device->GetDataRate().GetBitRate();
 		if (bitRate == 0) {
-			return std::numeric_limits<long double>::infinity();
+			return std::numeric_limits<uint64_t>::max();
 		}
-		const auto selected =
-			PacketDlbCumulativeEdgeBytes().find(PathEdgeKey(device));
-		const uint64_t selectedBytes =
-			selected == PacketDlbCumulativeEdgeBytes().end()
+		Ptr<QbbChannel> channel =
+			DynamicCast<QbbChannel>(device->GetChannel());
+		if (channel == nullptr) {
+			return std::numeric_limits<uint64_t>::max();
+		}
+		propagationNs = SaturatingAdd(
+			propagationNs, channel->GetDelay().GetNanoSeconds());
+		const uint64_t packetSerializationNs =
+			SerializationNs(packetBytes, bitRate);
+		onePacketSerializationNs = SaturatingAdd(
+			onePacketSerializationNs, packetSerializationNs);
+		slowestPacketSerializationNs = std::max(
+			slowestPacketSerializationNs, packetSerializationNs);
+		const auto assigned = qp->m_packetDlbAssignedEdgeBytes.find(
+			PathEdgeKey(device));
+		const uint64_t assignedBytes =
+			assigned == qp->m_packetDlbAssignedEdgeBytes.end()
 				? 0
-				: selected->second;
-		const long double workNs =
-			static_cast<long double>(
-				SaturatingAdd(selectedBytes, packetBytes)) *
-			8.0L * 1000000000.0L /
-			static_cast<long double>(bitRate);
-		maximumWorkNs = std::max(maximumWorkNs, workNs);
+				: assigned->second;
+		assignedEdgeTailNs = std::max(
+			assignedEdgeTailNs,
+			SerializationNs(
+				SaturatingAdd(assignedBytes, packetBytes), bitRate));
 	}
-	return maximumWorkNs;
+	const uint64_t pipelineFillNs =
+		onePacketSerializationNs >= slowestPacketSerializationNs
+			? onePacketSerializationNs - slowestPacketSerializationNs
+			: 0;
+	return SaturatingAdd(
+		SaturatingAdd(propagationNs, pipelineFillNs),
+		assignedEdgeTailNs);
 }
 
-void RecordPacketDlbCumulativePathBytes(
+void RecordPacketDlbQpPathBytes(
+		Ptr<RdmaQueuePair> qp,
 		const PacketDlbPathTemplate& pathTemplate,
 		uint64_t packetBytes) {
+	if (qp == nullptr) {
+		return;
+	}
 	for (const Ptr<QbbNetDevice>& device : pathTemplate) {
 		if (device == nullptr) {
 			continue;
 		}
-		uint64_t& selectedBytes =
-			PacketDlbCumulativeEdgeBytes()[PathEdgeKey(device)];
-		selectedBytes = SaturatingAdd(selectedBytes, packetBytes);
+		uint64_t& assignedBytes =
+			qp->m_packetDlbAssignedEdgeBytes[PathEdgeKey(device)];
+		assignedBytes = SaturatingAdd(assignedBytes, packetBytes);
 	}
 }
 
 void ReservePacketDlbPath(
 		const PathAwareCandidate& path,
-		uint64_t packetBytes) {
+		uint64_t packetBytes,
+		uint64_t earliestStartNs) {
 	uint64_t ignoredArrivalNs = 0;
 	SchedulePacketDlbPath(
-		path.hops, packetBytes, true, &ignoredArrivalNs);
+		path.hops, packetBytes, earliestStartNs, true, &ignoredArrivalNs);
 }
 
 uint32_t PacketDlbHash(uint32_t qpHash, uint64_t seq) {
@@ -1083,6 +1253,23 @@ uint32_t PacketDlbHash(uint32_t qpHash, uint64_t seq) {
 	mixed ^= mixed >> 31;
 	return qpHash ^ static_cast<uint32_t>(mixed) ^
 		static_cast<uint32_t>(mixed >> 32);
+}
+
+uint64_t PacketDlbLaneNextAvailNs(
+		Ptr<RdmaQueuePair> qp,
+		uint32_t nic,
+		uint64_t nowNs) {
+	if (qp == nullptr) {
+		return nowNs;
+	}
+	const auto available = qp->m_packetDlbLaneNextAvail.find(nic);
+	if (available == qp->m_packetDlbLaneNextAvail.end()) {
+		return nowNs;
+	}
+	const int64_t availableNs = available->second.GetNanoSeconds();
+	return availableNs <= 0
+		? nowNs
+		: std::max(nowNs, static_cast<uint64_t>(availableNs));
 }
 
 bool BuildBestPathFromDevice(
@@ -1284,11 +1471,921 @@ bool BuildCrossPairedDualTablePath(
 	return true;
 }
 
+struct P2rEndpointDevices {
+	Ptr<QbbNetDevice> group1;
+	std::vector<Ptr<QbbNetDevice>> group2;
+
+	bool valid() const {
+		return group1 != nullptr && group2.size() == 2;
+	}
+};
+
+uint32_t PeerNodeId(Ptr<QbbNetDevice> device) {
+	Ptr<QbbNetDevice> peer = GetPeerDevice(device, nullptr);
+	return peer == nullptr || peer->GetNode() == nullptr
+		? std::numeric_limits<uint32_t>::max()
+		: peer->GetNode()->GetId();
+}
+
+P2rEndpointDevices ClassifyP2rEndpointDevices(
+		const std::vector<Ptr<QbbNetDevice>>& devices) {
+	P2rEndpointDevices classified;
+	if (devices.size() != 3) {
+		return classified;
+	}
+
+	uint64_t highRate = 0;
+	uint64_t lowRate = std::numeric_limits<uint64_t>::max();
+	for (const Ptr<QbbNetDevice>& device : devices) {
+		if (device == nullptr) {
+			return P2rEndpointDevices{};
+		}
+		const uint64_t rate = device->GetDataRate().GetBitRate();
+		highRate = std::max(highRate, rate);
+		lowRate = std::min(lowRate, rate);
+	}
+	if (lowRate == 0 || highRate != lowRate * 2) {
+		return P2rEndpointDevices{};
+	}
+
+	for (const Ptr<QbbNetDevice>& device : devices) {
+		const uint64_t rate = device->GetDataRate().GetBitRate();
+		if (rate == highRate) {
+			if (classified.group1 != nullptr) {
+				return P2rEndpointDevices{};
+			}
+			classified.group1 = device;
+		} else if (rate == lowRate) {
+			classified.group2.push_back(device);
+		} else {
+			return P2rEndpointDevices{};
+		}
+	}
+	std::sort(
+		classified.group2.begin(),
+		classified.group2.end(),
+		[](const Ptr<QbbNetDevice>& lhs,
+		   const Ptr<QbbNetDevice>& rhs) {
+			return PeerNodeId(lhs) < PeerNodeId(rhs);
+		});
+	return classified.valid() ? classified : P2rEndpointDevices{};
+}
+
+bool FindP2rPreferredSourceCandidate(
+		const RdmaHw& hw,
+		const std::vector<int>& candidates,
+		uint32_t workerOrdinal,
+		uint32_t* preferredCandidate) {
+	if (preferredCandidate == nullptr || candidates.size() != 3) {
+		return false;
+	}
+	std::vector<Ptr<QbbNetDevice>> devices;
+	for (const int candidate : candidates) {
+		if (candidate < 0 ||
+			static_cast<uint32_t>(candidate) >= hw.m_nic.size() ||
+			hw.m_nic[candidate].dev == nullptr) {
+			return false;
+		}
+		devices.push_back(hw.m_nic[candidate].dev);
+	}
+	const P2rEndpointDevices classified =
+		ClassifyP2rEndpointDevices(devices);
+	if (!classified.valid()) {
+		return false;
+	}
+
+	Ptr<QbbNetDevice> preferredDevice;
+	if (workerOrdinal % 2 == 0) {
+		preferredDevice = classified.group1;
+	} else {
+		const size_t replica =
+			((workerOrdinal - 1) / 2) % classified.group2.size();
+		preferredDevice = classified.group2[replica];
+	}
+	for (const int candidate : candidates) {
+		if (hw.m_nic[candidate].dev == preferredDevice) {
+			*preferredCandidate = static_cast<uint32_t>(candidate);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool DevicesShareSwitch(
+		Ptr<QbbNetDevice> lhs,
+		Ptr<QbbNetDevice> rhs) {
+	const uint32_t lhsPeer = PeerNodeId(lhs);
+	return lhsPeer != std::numeric_limits<uint32_t>::max() &&
+		lhsPeer == PeerNodeId(rhs);
+}
+
+struct PacketDlbEndpointPairingFilter {
+	bool applicable = false;
+	std::vector<int32_t> destinationNics;
+
+	bool AllowsDestination(int32_t destinationNic) const {
+		return std::find(
+			destinationNics.begin(),
+			destinationNics.end(),
+			destinationNic) != destinationNics.end();
+	}
+};
+
+uint32_t PacketDlbEndpointMinimumHops(
+		Ptr<QbbNetDevice> sourceDevice,
+		Ptr<QbbNetDevice> destinationDevice) {
+	const uint32_t unreachable = std::numeric_limits<uint32_t>::max();
+	if (sourceDevice == nullptr || destinationDevice == nullptr ||
+		!sourceDevice->IsLinkUp() || !destinationDevice->IsLinkUp()) {
+		return unreachable;
+	}
+	Ptr<QbbNetDevice> sourceSwitchIngress =
+		GetPeerDevice(sourceDevice, nullptr);
+	Ptr<QbbNetDevice> destinationSwitchEgress =
+		GetPeerDevice(destinationDevice, nullptr);
+	Ptr<Node> sourceSwitch = sourceSwitchIngress == nullptr
+		? nullptr
+		: sourceSwitchIngress->GetNode();
+	Ptr<Node> destinationSwitch = destinationSwitchEgress == nullptr
+		? nullptr
+		: destinationSwitchEgress->GetNode();
+	if (sourceSwitch == nullptr || destinationSwitch == nullptr ||
+		sourceSwitch->GetNodeType() != 1 ||
+		destinationSwitch->GetNodeType() != 1) {
+		return unreachable;
+	}
+	if (sourceSwitch->GetId() == destinationSwitch->GetId()) {
+		return 2;
+	}
+
+	std::deque<std::pair<Ptr<Node>, uint32_t>> frontier;
+	std::unordered_set<uint32_t> visited{sourceSwitch->GetId()};
+	frontier.emplace_back(sourceSwitch, 0);
+	while (!frontier.empty()) {
+		Ptr<Node> current = frontier.front().first;
+		const uint32_t switchHops = frontier.front().second;
+		frontier.pop_front();
+		for (uint32_t deviceIndex = 0;
+			 deviceIndex < current->GetNDevices();
+			 ++deviceIndex) {
+			Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(
+				current->GetDevice(deviceIndex));
+			if (device == nullptr || !device->IsLinkUp()) {
+				continue;
+			}
+			Ptr<QbbNetDevice> peer = GetPeerDevice(device, nullptr);
+			Ptr<Node> next = peer == nullptr ? nullptr : peer->GetNode();
+			if (next == nullptr || next->GetNodeType() != 1) {
+				continue;
+			}
+			const uint32_t nextSwitchHops = switchHops + 1;
+			if (next->GetId() == destinationSwitch->GetId()) {
+				return nextSwitchHops + 2;
+			}
+			if (visited.insert(next->GetId()).second) {
+				frontier.emplace_back(next, nextSwitchHops);
+			}
+		}
+	}
+	return unreachable;
+}
+
+struct PacketDlbEndpointFlowEdge {
+	size_t to = 0;
+	size_t reverse = 0;
+	uint64_t capacity = 0;
+	int64_t cost = 0;
+};
+
+struct PacketDlbEndpointFlowHandle {
+	size_t sourceIndex = 0;
+	size_t destinationIndex = 0;
+	size_t node = 0;
+	size_t edge = 0;
+	uint64_t initialCapacity = 0;
+};
+
+void AddPacketDlbEndpointFlowEdge(
+		size_t from,
+		size_t to,
+		uint64_t capacity,
+		int64_t cost,
+		std::vector<std::vector<PacketDlbEndpointFlowEdge>>* graph) {
+	if (graph == nullptr || from >= graph->size() || to >= graph->size()) {
+		return;
+	}
+	const size_t forwardIndex = (*graph)[from].size();
+	const size_t reverseIndex = (*graph)[to].size();
+	(*graph)[from].push_back(PacketDlbEndpointFlowEdge{
+		to, reverseIndex, capacity, cost});
+	(*graph)[to].push_back(PacketDlbEndpointFlowEdge{
+		from, forwardIndex, 0, -cost});
+}
+
+std::vector<PacketDlbEndpointPairingFilter>
+BuildPacketDlbEndpointPairingFilters(
+		const std::vector<Ptr<QbbNetDevice>>& sourceDevices,
+		const std::vector<Ptr<QbbNetDevice>>& destinationDevices) {
+	std::vector<PacketDlbEndpointPairingFilter> filters(
+		sourceDevices.size());
+	if (sourceDevices.size() < 2 || destinationDevices.size() < 2) {
+		return filters;
+	}
+
+	uint64_t totalSourceRate = 0;
+	uint64_t totalDestinationRate = 0;
+	for (const Ptr<QbbNetDevice>& source : sourceDevices) {
+		if (source == nullptr || source->GetDataRate().GetBitRate() == 0) {
+			return filters;
+		}
+		totalSourceRate = SaturatingAdd(
+			totalSourceRate, source->GetDataRate().GetBitRate());
+	}
+	for (const Ptr<QbbNetDevice>& destination : destinationDevices) {
+		if (destination == nullptr ||
+			destination->GetDataRate().GetBitRate() == 0) {
+			return filters;
+		}
+		totalDestinationRate = SaturatingAdd(
+			totalDestinationRate,
+			destination->GetDataRate().GetBitRate());
+	}
+	if (totalSourceRate == 0 ||
+		totalSourceRate != totalDestinationRate) {
+		return filters;
+	}
+
+	const uint32_t unreachable = std::numeric_limits<uint32_t>::max();
+	std::vector<std::vector<uint32_t>> minimumHops(
+		sourceDevices.size(),
+		std::vector<uint32_t>(destinationDevices.size(), unreachable));
+	bool completeUniformMatrix = true;
+	uint32_t firstHops = unreachable;
+	for (size_t source = 0; source < sourceDevices.size(); ++source) {
+		for (size_t destination = 0;
+			 destination < destinationDevices.size();
+			 ++destination) {
+			const uint32_t hops = PacketDlbEndpointMinimumHops(
+				sourceDevices[source], destinationDevices[destination]);
+			minimumHops[source][destination] = hops;
+			if (hops == unreachable) {
+				completeUniformMatrix = false;
+				continue;
+			}
+			if (firstHops == unreachable) {
+				firstHops = hops;
+			} else if (hops != firstHops) {
+				completeUniformMatrix = false;
+			}
+		}
+	}
+	// When every endpoint pairing is structurally identical, retaining all
+	// combinations gives the live ETA selector the most freedom.
+	if (completeUniformMatrix) {
+		return filters;
+	}
+
+	const size_t sourceBase = 1;
+	const size_t destinationBase = sourceBase + sourceDevices.size();
+	const size_t sink = destinationBase + destinationDevices.size();
+	std::vector<std::vector<PacketDlbEndpointFlowEdge>> graph(sink + 1);
+	for (size_t source = 0; source < sourceDevices.size(); ++source) {
+		AddPacketDlbEndpointFlowEdge(
+			0,
+			sourceBase + source,
+			sourceDevices[source]->GetDataRate().GetBitRate(),
+			0,
+			&graph);
+	}
+	for (size_t destination = 0;
+		 destination < destinationDevices.size();
+		 ++destination) {
+		AddPacketDlbEndpointFlowEdge(
+			destinationBase + destination,
+			sink,
+			destinationDevices[destination]->GetDataRate().GetBitRate(),
+			0,
+			&graph);
+	}
+
+	std::vector<PacketDlbEndpointFlowHandle> handles;
+	constexpr int64_t kHopCostScale = 1024;
+	for (size_t source = 0; source < sourceDevices.size(); ++source) {
+		for (size_t destination = 0;
+			 destination < destinationDevices.size();
+			 ++destination) {
+			const uint32_t hops = minimumHops[source][destination];
+			if (hops == unreachable) {
+				continue;
+			}
+			const uint64_t capacity = std::min(
+				sourceDevices[source]->GetDataRate().GetBitRate(),
+				destinationDevices[destination]->GetDataRate().GetBitRate());
+			const int64_t directSwitchBonus = hops == 2 ? 1 : 0;
+			const int64_t cost =
+				static_cast<int64_t>(hops) * kHopCostScale -
+				directSwitchBonus;
+			const size_t node = sourceBase + source;
+			const size_t edge = graph[node].size();
+			AddPacketDlbEndpointFlowEdge(
+				node,
+				destinationBase + destination,
+				capacity,
+				cost,
+				&graph);
+			handles.push_back(PacketDlbEndpointFlowHandle{
+				source, destination, node, edge, capacity});
+		}
+	}
+
+	uint64_t transportedRate = 0;
+	const int64_t infinity = std::numeric_limits<int64_t>::max() / 4;
+	while (transportedRate < totalSourceRate) {
+		std::vector<int64_t> distance(graph.size(), infinity);
+		std::vector<int64_t> parentNode(graph.size(), -1);
+		std::vector<int64_t> parentEdge(graph.size(), -1);
+		distance[0] = 0;
+		for (size_t iteration = 1;
+			 iteration < graph.size();
+			 ++iteration) {
+			bool changed = false;
+			for (size_t node = 0; node < graph.size(); ++node) {
+				if (distance[node] == infinity) {
+					continue;
+				}
+				for (size_t edge = 0;
+					 edge < graph[node].size();
+					 ++edge) {
+					const PacketDlbEndpointFlowEdge& candidate =
+						graph[node][edge];
+					if (candidate.capacity == 0) {
+						continue;
+					}
+					const int64_t nextDistance =
+						distance[node] + candidate.cost;
+					if (nextDistance >= distance[candidate.to]) {
+						continue;
+					}
+					distance[candidate.to] = nextDistance;
+					parentNode[candidate.to] =
+						static_cast<int64_t>(node);
+					parentEdge[candidate.to] =
+						static_cast<int64_t>(edge);
+					changed = true;
+				}
+			}
+			if (!changed) {
+				break;
+			}
+		}
+		if (parentNode[sink] < 0) {
+			return std::vector<PacketDlbEndpointPairingFilter>(
+				sourceDevices.size());
+		}
+
+		uint64_t augment = totalSourceRate - transportedRate;
+		for (size_t node = sink; node != 0;) {
+			const size_t previous =
+				static_cast<size_t>(parentNode[node]);
+			const size_t edge =
+				static_cast<size_t>(parentEdge[node]);
+			augment = std::min(
+				augment, graph[previous][edge].capacity);
+			node = previous;
+		}
+		if (augment == 0) {
+			return std::vector<PacketDlbEndpointPairingFilter>(
+				sourceDevices.size());
+		}
+		for (size_t node = sink; node != 0;) {
+			const size_t previous =
+				static_cast<size_t>(parentNode[node]);
+			const size_t edgeIndex =
+				static_cast<size_t>(parentEdge[node]);
+			PacketDlbEndpointFlowEdge& edge =
+				graph[previous][edgeIndex];
+			const size_t reverse = edge.reverse;
+			edge.capacity -= augment;
+			graph[node][reverse].capacity =
+				SaturatingAdd(
+					graph[node][reverse].capacity, augment);
+			node = previous;
+		}
+		transportedRate = SaturatingAdd(transportedRate, augment);
+	}
+
+	for (const PacketDlbEndpointFlowHandle& handle : handles) {
+		const PacketDlbEndpointFlowEdge& edge =
+			graph[handle.node][handle.edge];
+		if (edge.capacity == handle.initialCapacity) {
+			continue;
+		}
+		const int32_t destinationNic = static_cast<int32_t>(
+			destinationDevices[handle.destinationIndex]->GetIfIndex());
+		std::vector<int32_t>& allowed =
+			filters[handle.sourceIndex].destinationNics;
+		if (std::find(
+				allowed.begin(), allowed.end(), destinationNic) ==
+				allowed.end()) {
+			allowed.push_back(destinationNic);
+		}
+	}
+	for (PacketDlbEndpointPairingFilter& filter : filters) {
+		if (filter.destinationNics.empty()) {
+			return std::vector<PacketDlbEndpointPairingFilter>(
+				sourceDevices.size());
+		}
+		std::sort(
+			filter.destinationNics.begin(),
+			filter.destinationNics.end());
+		filter.applicable = true;
+	}
+	return filters;
+}
+
+std::unordered_map<
+	PacketDlbPathCacheKey,
+	PacketDlbEndpointPairingFilter,
+	PacketDlbPathCacheKeyHash>& PacketDlbEndpointPairingCache() {
+	static std::unordered_map<
+		PacketDlbPathCacheKey,
+		PacketDlbEndpointPairingFilter,
+		PacketDlbPathCacheKeyHash> cache;
+	return cache;
+}
+
+std::mutex& PacketDlbEndpointPairingCacheMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+PacketDlbEndpointPairingFilter GetPacketDlbEndpointPairingFilter(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNode) {
+	PacketDlbEndpointPairingFilter none;
+	if (sourceDevice == nullptr || sourceDevice->GetNode() == nullptr) {
+		return none;
+	}
+	const PacketDlbPathCacheKey key{
+		sourceDevice->GetNode()->GetId(),
+		sourceDevice->GetIfIndex(),
+		destinationNode,
+		0,
+	};
+	std::lock_guard<std::mutex> cacheGuard(
+		PacketDlbEndpointPairingCacheMutex());
+	auto found = PacketDlbEndpointPairingCache().find(key);
+	if (found != PacketDlbEndpointPairingCache().end()) {
+		return found->second;
+	}
+
+	const std::vector<Ptr<QbbNetDevice>> sourceDevices =
+		GetGpuFabricDevices(sourceDevice->GetNode());
+	Ptr<Node> destinationGpu = NodeList::GetNode(destinationNode);
+	const std::vector<Ptr<QbbNetDevice>> destinationDevices =
+		destinationGpu == nullptr
+			? std::vector<Ptr<QbbNetDevice>>{}
+			: GetGpuFabricDevices(destinationGpu);
+	const std::vector<PacketDlbEndpointPairingFilter> filters =
+		BuildPacketDlbEndpointPairingFilters(
+			sourceDevices, destinationDevices);
+	for (size_t sourceIndex = 0;
+		 sourceIndex < sourceDevices.size() &&
+		 sourceIndex < filters.size();
+		 ++sourceIndex) {
+		const PacketDlbPathCacheKey sourceKey{
+			sourceDevices[sourceIndex]->GetNode()->GetId(),
+			sourceDevices[sourceIndex]->GetIfIndex(),
+			destinationNode,
+			0,
+		};
+		PacketDlbEndpointPairingCache()[sourceKey] =
+			filters[sourceIndex];
+	}
+	found = PacketDlbEndpointPairingCache().find(key);
+	if (found != PacketDlbEndpointPairingCache().end()) {
+		return found->second;
+	}
+	PacketDlbEndpointPairingCache().emplace(key, none);
+	return none;
+}
+
+struct SwitchPacketDlbEstimateKey {
+	uint32_t sourceNode = 0;
+	uint32_t sourceNic = 0;
+	uint32_t destinationNode = 0;
+	uint32_t dip = 0;
+	uint32_t packetBytes = 0;
+
+	bool operator==(const SwitchPacketDlbEstimateKey& other) const {
+		return sourceNode == other.sourceNode &&
+			sourceNic == other.sourceNic &&
+			destinationNode == other.destinationNode &&
+			dip == other.dip &&
+			packetBytes == other.packetBytes;
+	}
+};
+
+struct SwitchPacketDlbEstimateKeyHash {
+	std::size_t operator()(
+			const SwitchPacketDlbEstimateKey& key) const {
+		std::size_t hash = key.sourceNode;
+		auto combine = [&](uint32_t value) {
+			hash ^= static_cast<std::size_t>(value) + 0x9e3779b9U +
+				(hash << 6) + (hash >> 2);
+		};
+		combine(key.sourceNic);
+		combine(key.destinationNode);
+		combine(key.dip);
+		combine(key.packetBytes);
+		return hash;
+	}
+};
+
+struct SwitchPacketDlbPathEstimate {
+	bool valid = false;
+	bool endpointPinned = false;
+	int32_t destinationNic = -1;
+	uint32_t hops = 0;
+	uint64_t baseLatencyNs = 0;
+	uint64_t propagationNs = 0;
+};
+
+std::unordered_map<
+	SwitchPacketDlbEstimateKey,
+	std::vector<SwitchPacketDlbPathEstimate>,
+	SwitchPacketDlbEstimateKeyHash>&
+SwitchPacketDlbEstimateCache() {
+	static std::unordered_map<
+		SwitchPacketDlbEstimateKey,
+		std::vector<SwitchPacketDlbPathEstimate>,
+		SwitchPacketDlbEstimateKeyHash> cache;
+	return cache;
+}
+
+std::mutex& SwitchPacketDlbEstimateCacheMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+std::vector<SwitchPacketDlbPathEstimate>
+BuildSwitchPacketDlbPathEstimates(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNode,
+		uint32_t dip,
+		uint32_t packetBytes) {
+	std::vector<SwitchPacketDlbPathEstimate> estimates;
+	if (sourceDevice == nullptr || sourceDevice->GetNode() == nullptr ||
+		packetBytes == 0) {
+		return estimates;
+	}
+	const PacketDlbEndpointPairingFilter endpointPairing =
+		GetPacketDlbEndpointPairingFilter(
+			sourceDevice, destinationNode);
+	const PacketDlbPathTemplates& paths = GetPacketDlbPathTemplates(
+		sourceDevice, destinationNode, dip);
+	const bool balancedThreeHop =
+		PacketDlbBalancedThreeHopEnabled();
+	const bool constrainHopMode =
+		balancedThreeHop || PacketDlbTwoFourHopEnabled();
+	std::map<int32_t, SwitchPacketDlbPathEstimate> bestByDestination;
+	std::map<int32_t, SwitchPacketDlbPathEstimate> fallbackByDestination;
+	auto retainBest = [](
+			std::map<int32_t, SwitchPacketDlbPathEstimate>* candidates,
+			int32_t destinationNic,
+			const SwitchPacketDlbPathEstimate& estimate) {
+		auto found = candidates->find(destinationNic);
+		if (found == candidates->end() ||
+			estimate.baseLatencyNs < found->second.baseLatencyNs ||
+			(estimate.baseLatencyNs == found->second.baseLatencyNs &&
+			 estimate.hops < found->second.hops)) {
+			(*candidates)[destinationNic] = estimate;
+		}
+	};
+	for (const PacketDlbPathTemplate& path : paths) {
+		const int32_t destinationNic =
+			PacketDlbPathDestinationNic(path);
+		if (destinationNic < 0 ||
+			(!balancedThreeHop && endpointPairing.applicable &&
+			 !endpointPairing.AllowsDestination(destinationNic))) {
+			continue;
+		}
+
+		uint64_t propagationNs = 0;
+		uint64_t serializationNs = 0;
+		bool valid = !path.empty();
+		for (const Ptr<QbbNetDevice>& device : path) {
+			if (device == nullptr || !device->IsLinkUp()) {
+				valid = false;
+				break;
+			}
+			const uint64_t bitRate =
+				device->GetDataRate().GetBitRate();
+			Ptr<QbbChannel> channel =
+				DynamicCast<QbbChannel>(device->GetChannel());
+			if (bitRate == 0 || channel == nullptr) {
+				valid = false;
+				break;
+			}
+			propagationNs = SaturatingAdd(
+				propagationNs,
+				static_cast<uint64_t>(
+					channel->GetDelay().GetNanoSeconds()));
+			serializationNs = SaturatingAdd(
+				serializationNs,
+				SerializationNs(packetBytes, bitRate));
+		}
+		if (!valid) {
+			continue;
+		}
+
+		SwitchPacketDlbPathEstimate estimate;
+		estimate.valid = true;
+		estimate.endpointPinned =
+			balancedThreeHop || endpointPairing.applicable;
+		estimate.destinationNic = destinationNic;
+		estimate.hops = static_cast<uint32_t>(path.size());
+		estimate.baseLatencyNs = SaturatingAdd(
+			propagationNs, serializationNs);
+		estimate.propagationNs = propagationNs;
+		retainBest(&fallbackByDestination, destinationNic, estimate);
+		if (!constrainHopMode ||
+			PacketDlbPathMatchesConfiguredHopMode(path)) {
+			retainBest(&bestByDestination, destinationNic, estimate);
+		}
+	}
+	if (bestByDestination.empty()) {
+		bestByDestination = std::move(fallbackByDestination);
+	}
+	for (const auto& item : bestByDestination) {
+		estimates.push_back(item.second);
+	}
+	return estimates;
+}
+
+const std::vector<SwitchPacketDlbPathEstimate>&
+GetSwitchPacketDlbPathEstimates(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNode,
+		uint32_t dip,
+		uint32_t packetBytes) {
+	static const std::vector<SwitchPacketDlbPathEstimate> empty;
+	if (sourceDevice == nullptr || sourceDevice->GetNode() == nullptr) {
+		return empty;
+	}
+	const SwitchPacketDlbEstimateKey key{
+		sourceDevice->GetNode()->GetId(),
+		sourceDevice->GetIfIndex(),
+		destinationNode,
+		dip,
+		packetBytes,
+	};
+	{
+		std::lock_guard<std::mutex> guard(
+			SwitchPacketDlbEstimateCacheMutex());
+		auto found = SwitchPacketDlbEstimateCache().find(key);
+		if (found != SwitchPacketDlbEstimateCache().end()) {
+			return found->second;
+		}
+	}
+	std::vector<SwitchPacketDlbPathEstimate> estimates =
+		BuildSwitchPacketDlbPathEstimates(
+			sourceDevice,
+			destinationNode,
+			dip,
+			packetBytes);
+	std::lock_guard<std::mutex> guard(
+		SwitchPacketDlbEstimateCacheMutex());
+	return SwitchPacketDlbEstimateCache()
+		.emplace(key, std::move(estimates))
+		.first->second;
+}
+
+SwitchPacketDlbPathEstimate SelectSwitchPacketDlbPathEstimate(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNode,
+		uint32_t dip,
+		uint32_t packetBytes,
+		uint32_t packetHash) {
+	const std::vector<SwitchPacketDlbPathEstimate>& estimates =
+		GetSwitchPacketDlbPathEstimates(
+			sourceDevice,
+			destinationNode,
+			dip,
+			packetBytes);
+	uint64_t bestLatencyNs = std::numeric_limits<uint64_t>::max();
+	std::vector<const SwitchPacketDlbPathEstimate*> best;
+	for (const SwitchPacketDlbPathEstimate& estimate : estimates) {
+		if (!estimate.valid) {
+			continue;
+		}
+		if (estimate.baseLatencyNs < bestLatencyNs) {
+			bestLatencyNs = estimate.baseLatencyNs;
+			best.clear();
+		}
+		if (estimate.baseLatencyNs == bestLatencyNs) {
+			best.push_back(&estimate);
+		}
+	}
+	if (best.empty()) {
+		return SwitchPacketDlbPathEstimate{};
+	}
+	return *best[packetHash % best.size()];
+}
+
+bool PacketDlbEndpointPairedPathAllowed(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNode,
+		const PacketDlbPathTemplate& pathTemplate,
+		bool* filterApplied) {
+	const PacketDlbEndpointPairingFilter filter =
+		GetPacketDlbEndpointPairingFilter(
+			sourceDevice, destinationNode);
+	if (filterApplied != nullptr) {
+		*filterApplied = filter.applicable;
+	}
+	if (!filter.applicable) {
+		return true;
+	}
+	return filter.AllowsDestination(
+		PacketDlbPathDestinationNic(pathTemplate));
+}
+
+bool BuildP2rEndpointPath(
+		Ptr<QbbNetDevice> sourceDevice,
+		Ptr<QbbNetDevice> destinationDevice,
+		uint32_t qpHash,
+		uint64_t qpBytes,
+		PathAwareCandidate* result) {
+	if (sourceDevice == nullptr || destinationDevice == nullptr ||
+		result == nullptr) {
+		return false;
+	}
+	Ptr<QbbNetDevice> sourceSwitchIngress =
+		GetPeerDevice(sourceDevice, nullptr);
+	Ptr<QbbNetDevice> destinationSwitchEgress =
+		GetPeerDevice(destinationDevice, nullptr);
+	Ptr<Node> sourceSwitch = sourceSwitchIngress == nullptr
+		? nullptr
+		: sourceSwitchIngress->GetNode();
+	Ptr<Node> destinationSwitch = destinationSwitchEgress == nullptr
+		? nullptr
+		: destinationSwitchEgress->GetNode();
+	if (sourceSwitch == nullptr || destinationSwitch == nullptr ||
+		sourceSwitch->GetNodeType() != 1 ||
+		destinationSwitch->GetNodeType() != 1) {
+		return false;
+	}
+
+	PathAwareCandidate best;
+	long double bestScore = std::numeric_limits<long double>::infinity();
+	auto consider = [&](PathAwareCandidate path) {
+		if (!path.valid) {
+			return;
+		}
+		const long double score = PathScoreNs(path, qpBytes, true);
+		if (score < bestScore) {
+			best = std::move(path);
+			bestScore = score;
+		}
+	};
+
+	if (sourceSwitch->GetId() == destinationSwitch->GetId()) {
+		PathAwareCandidate direct;
+		if (AppendPathHop(sourceDevice, &direct) &&
+			AppendPathHop(destinationSwitchEgress, &direct)) {
+			consider(std::move(direct));
+		}
+	} else {
+		Ptr<QbbNetDevice> interSwitchDevice = FindDeviceToNode(
+			sourceSwitch, destinationSwitch->GetId());
+		if (interSwitchDevice != nullptr) {
+			PathAwareCandidate cross;
+			if (AppendPathHop(sourceDevice, &cross) &&
+				AppendPathHop(interSwitchDevice, &cross) &&
+				AppendPathHop(destinationSwitchEgress, &cross)) {
+				consider(std::move(cross));
+			}
+		} else {
+			const uint32_t deviceCount = sourceSwitch->GetNDevices();
+			const uint32_t deviceStart = deviceCount == 0
+				? 0
+				: (qpHash ^ sourceSwitch->GetId() ^
+				   destinationSwitch->GetId()) %
+					deviceCount;
+			for (uint32_t offset = 0; offset < deviceCount; ++offset) {
+				const uint32_t deviceIndex =
+					(deviceStart + offset) % deviceCount;
+				Ptr<QbbNetDevice> firstInterSwitchDevice =
+					DynamicCast<QbbNetDevice>(
+						sourceSwitch->GetDevice(deviceIndex));
+				Ptr<QbbNetDevice> middleIngress =
+					GetPeerDevice(firstInterSwitchDevice, nullptr);
+				Ptr<Node> middleSwitch = middleIngress == nullptr
+					? nullptr
+					: middleIngress->GetNode();
+				if (middleSwitch == nullptr ||
+					middleSwitch->GetNodeType() != 1 ||
+					middleSwitch->GetId() ==
+						destinationSwitch->GetId()) {
+					continue;
+				}
+				Ptr<QbbNetDevice> secondInterSwitchDevice =
+					FindDeviceToNode(
+						middleSwitch, destinationSwitch->GetId());
+				if (secondInterSwitchDevice == nullptr) {
+					continue;
+				}
+				PathAwareCandidate relay;
+				if (AppendPathHop(sourceDevice, &relay) &&
+					AppendPathHop(firstInterSwitchDevice, &relay) &&
+					AppendPathHop(secondInterSwitchDevice, &relay) &&
+					AppendPathHop(destinationSwitchEgress, &relay)) {
+					consider(std::move(relay));
+				}
+			}
+		}
+	}
+
+	if (!best.valid) {
+		return false;
+	}
+	*result = std::move(best);
+	return true;
+}
+
+bool BuildP2rDisjointPath(
+		Ptr<QbbNetDevice> sourceDevice,
+		uint32_t destinationNodeId,
+		uint32_t qpHash,
+		uint64_t qpBytes,
+		uint32_t sourceNicOrdinalHint,
+		PathAwareCandidate* result) {
+	if (sourceDevice == nullptr || result == nullptr) {
+		return false;
+	}
+	const P2rEndpointDevices source = ClassifyP2rEndpointDevices(
+		GetGpuFabricDevices(sourceDevice->GetNode()));
+	const P2rEndpointDevices destination = ClassifyP2rEndpointDevices(
+		GetGpuFabricDevices(NodeList::GetNode(destinationNodeId)));
+	if (!source.valid() || !destination.valid()) {
+		return false;
+	}
+
+	const bool sharedGroup1 =
+		DevicesShareSwitch(source.group1, destination.group1);
+	bool sharedGroup2 = false;
+	for (const Ptr<QbbNetDevice>& sourceGroup2 : source.group2) {
+		for (const Ptr<QbbNetDevice>& destinationGroup2 :
+			 destination.group2) {
+			sharedGroup2 = sharedGroup2 ||
+				DevicesShareSwitch(sourceGroup2, destinationGroup2);
+		}
+	}
+	const bool sameRolePairing = sharedGroup1 || sharedGroup2;
+
+	Ptr<QbbNetDevice> destinationDevice;
+	if (sourceDevice == source.group1) {
+		if (sameRolePairing) {
+			destinationDevice = destination.group1;
+		} else {
+			const uint32_t replica =
+				sourceNicOrdinalHint ==
+					std::numeric_limits<uint32_t>::max()
+				? qpHash % destination.group2.size()
+				: (sourceNicOrdinalHint / 2) %
+					destination.group2.size();
+			destinationDevice = destination.group2[replica];
+		}
+	} else {
+		auto sourceReplica = std::find(
+			source.group2.begin(), source.group2.end(), sourceDevice);
+		if (sourceReplica == source.group2.end()) {
+			return false;
+		}
+		if (sameRolePairing) {
+			const size_t replica = static_cast<size_t>(
+				std::distance(source.group2.begin(), sourceReplica));
+			destinationDevice = destination.group2[replica];
+		} else {
+			destinationDevice = destination.group1;
+		}
+	}
+
+	return BuildP2rEndpointPath(
+		sourceDevice,
+		destinationDevice,
+		qpHash,
+		qpBytes,
+		result);
+}
+
 bool BuildAdaptiveDualTablePath(
 		Ptr<QbbNetDevice> sourceDevice,
 		uint32_t destinationNodeId,
 		uint32_t qpHash,
 		uint64_t qpBytes,
+		uint32_t sourceNicOrdinalHint,
 		PathAwareCandidate* result) {
 	if (sourceDevice == nullptr || result == nullptr) {
 		return false;
@@ -1299,6 +2396,17 @@ bool BuildAdaptiveDualTablePath(
 		GetGpuFabricDevices(sourceGpu);
 	const std::vector<Ptr<QbbNetDevice>> destinationFabricDevices =
 		GetGpuFabricDevices(destinationGpu);
+	if (SwitchNode::DisjointChunkRoutingEnabled() &&
+		sourceFabricDevices.size() == 3 &&
+		destinationFabricDevices.size() == 3) {
+		return BuildP2rDisjointPath(
+			sourceDevice,
+			destinationNodeId,
+			qpHash,
+			qpBytes,
+			sourceNicOrdinalHint,
+			result);
+	}
 	if (sourceFabricDevices.size() != 2 ||
 		destinationFabricDevices.size() != 2) {
 		return false;
@@ -1480,7 +2588,9 @@ bool BuildPolicyPathFromDevice(
 		uint32_t qpHash,
 		uint64_t qpBytes,
 		bool crossPairedDualTable,
-		PathAwareCandidate* result) {
+		PathAwareCandidate* result,
+		uint32_t sourceNicOrdinalHint =
+			std::numeric_limits<uint32_t>::max()) {
 	if (crossPairedDualTable) {
 		if (SwitchNode::AdaptiveZcubeRoutingEnabled() &&
 			BuildAdaptiveDualTablePath(
@@ -1488,6 +2598,7 @@ bool BuildPolicyPathFromDevice(
 				destinationNode,
 				qpHash,
 				qpBytes,
+				sourceNicOrdinalHint,
 				result)) {
 			return true;
 		}
@@ -1696,11 +2807,262 @@ void RebindPathAwareRoute(
 	BindPathAwareRoute(qp, path, reservationBytes);
 }
 
+uint32_t SelectSwitchPacketDlbTxNic(
+		RdmaHw* hw,
+		Ptr<RdmaQueuePair> qp,
+		uint32_t currentNic) {
+	if (!qp->m_packetDlbCandidatesInitialized) {
+		qp->m_packetDlbCandidates = GetDualTableSourceCandidates(*hw);
+		if (qp->m_packetDlbCandidates.empty()) {
+			auto routes = hw->m_rtTable.find(qp->dip.Get());
+			if (routes != hw->m_rtTable.end()) {
+				qp->m_packetDlbCandidates = routes->second;
+			}
+		}
+		qp->m_packetDlbCandidatesInitialized = true;
+	}
+	const std::vector<int>& candidates = qp->m_packetDlbCandidates;
+	if (candidates.size() <= 1) {
+		return currentNic;
+	}
+	if (qp->m_packetDlbPrepared) {
+		CancelPreparedPacketDlbRoute(qp);
+	}
+
+	const uint64_t packetBytes = std::min(
+		static_cast<uint64_t>(hw->m_mtu), qp->GetBytesLeft());
+	if (packetBytes == 0) {
+		return currentNic;
+	}
+	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+	const uint64_t seq = qp->snd_nxt;
+	const uint32_t packetHash = PacketDlbHash(qp->GetHash(), seq);
+	const uint32_t start = packetHash % candidates.size();
+	const uint32_t destinationNode = (qp->dip.Get() >> 8) & 0xffff;
+	std::vector<SwitchPacketDlbPathEstimate> pathEstimates(
+		hw->m_nic.size());
+	uint64_t minimumPathLatencyNs =
+		std::numeric_limits<uint64_t>::max();
+	uint32_t minimumPathHops =
+		std::numeric_limits<uint32_t>::max();
+	for (const int candidateValue : candidates) {
+		if (candidateValue < 0) {
+			continue;
+		}
+		const uint32_t candidate =
+			static_cast<uint32_t>(candidateValue);
+		if (candidate >= hw->m_nic.size() ||
+			hw->m_nic[candidate].dev == nullptr ||
+			!hw->m_nic[candidate].dev->IsLinkUp()) {
+			continue;
+		}
+		pathEstimates[candidate] =
+			SelectSwitchPacketDlbPathEstimate(
+				hw->m_nic[candidate].dev,
+				destinationNode,
+				qp->dip.Get(),
+				static_cast<uint32_t>(packetBytes),
+				packetHash);
+		if (pathEstimates[candidate].valid) {
+			minimumPathLatencyNs = std::min(
+				minimumPathLatencyNs,
+				pathEstimates[candidate].baseLatencyNs);
+			minimumPathHops = std::min(
+				minimumPathHops,
+				pathEstimates[candidate].hops);
+		}
+	}
+
+	uint32_t selected = std::numeric_limits<uint32_t>::max();
+	uint32_t viableCandidates = 0;
+	uint64_t selectedScoreNs = std::numeric_limits<uint64_t>::max();
+	uint64_t selectedLaneReadyNs = nowNs;
+	uint64_t selectedQueueBytes = 0;
+	uint64_t selectedQueueDelayNs = 0;
+	uint64_t selectedPropagationNs = 0;
+	uint32_t selectedPathHops = 0;
+	int32_t selectedDestinationNic = -1;
+	bool selectedEndpointPinned = false;
+	uint64_t currentScoreNs = std::numeric_limits<uint64_t>::max();
+	auto evaluateCandidates = [&](bool allowPaused) {
+		for (uint32_t offset = 0; offset < candidates.size(); ++offset) {
+			const int candidateValue =
+				candidates[(start + offset) % candidates.size()];
+			if (candidateValue < 0) {
+				continue;
+			}
+			const uint32_t candidate =
+				static_cast<uint32_t>(candidateValue);
+			if (candidate >= hw->m_nic.size()) {
+				continue;
+			}
+			Ptr<QbbNetDevice> device = hw->m_nic[candidate].dev;
+			if (device == nullptr || !device->IsLinkUp() ||
+				(!allowPaused && device->IsPriorityPaused(qp->m_pg))) {
+				continue;
+			}
+			const uint64_t bitRate = device->GetDataRate().GetBitRate();
+			if (bitRate == 0) {
+				continue;
+			}
+			const uint64_t laneReadyNs =
+				PacketDlbLaneNextAvailNs(qp, candidate, nowNs);
+			const uint64_t queueBytes = device->GetQueue() == nullptr
+				? 0
+				: device->GetQueue()->GetNBytesTotal();
+			const uint64_t queuedWorkNs = SaturatingAdd(
+				device->GetTxRemainingNs(),
+				SerializationNs(queueBytes, bitRate));
+			const uint64_t physicalReadyNs =
+				SaturatingAdd(nowNs, queuedWorkNs);
+			const uint64_t readyNs =
+				std::max(laneReadyNs, physicalReadyNs);
+			const SwitchPacketDlbPathEstimate pathEstimate =
+				pathEstimates[candidate];
+			Ptr<QbbChannel> channel =
+				DynamicCast<QbbChannel>(device->GetChannel());
+			const uint64_t firstHopPropagationNs =
+				channel == nullptr
+				? 0
+				: static_cast<uint64_t>(
+					channel->GetDelay().GetNanoSeconds());
+			uint64_t baseLatencyNs = SaturatingAdd(
+				SerializationNs(packetBytes, bitRate),
+				firstHopPropagationNs);
+			if (pathEstimate.valid &&
+				minimumPathLatencyNs !=
+					std::numeric_limits<uint64_t>::max() &&
+				pathEstimate.baseLatencyNs >
+					minimumPathLatencyNs) {
+				const uint64_t extraPathLatencyNs =
+					pathEstimate.baseLatencyNs -
+					minimumPathLatencyNs;
+				const uint64_t remainingBytes = std::max(
+					packetBytes, qp->GetBytesLeft());
+				const long double amortizedPenaltyNs =
+					static_cast<long double>(
+						extraPathLatencyNs) *
+					static_cast<long double>(packetBytes) /
+					static_cast<long double>(remainingBytes);
+				baseLatencyNs = SaturatingAdd(
+					baseLatencyNs,
+					SaturatingNs(
+						std::ceil(amortizedPenaltyNs)));
+			}
+			const uint64_t queueDelayNs = readyNs - nowNs;
+			// Adapt UGAL-L's local-congestion-by-distance comparison to
+			// independent source NICs by using path stretch. A 3+3 pair has
+			// equal cost, while the 4-hop side of a 2+4 pair pays 2x.
+			uint64_t hopWeightedQueueDelayNs = queueDelayNs;
+			if (pathEstimate.valid && minimumPathHops !=
+					std::numeric_limits<uint32_t>::max() &&
+				minimumPathHops > 0) {
+				const long double pathStretch =
+					static_cast<long double>(pathEstimate.hops) /
+					static_cast<long double>(minimumPathHops);
+				hopWeightedQueueDelayNs = SaturatingNs(std::ceil(
+					static_cast<long double>(queueDelayNs) *
+					pathStretch));
+			}
+			const uint64_t scoreNs = SaturatingAdd(
+				hopWeightedQueueDelayNs, baseLatencyNs);
+			++viableCandidates;
+			if (candidate == currentNic) {
+				currentScoreNs = scoreNs;
+			}
+			if (scoreNs < selectedScoreNs) {
+				selected = candidate;
+				selectedScoreNs = scoreNs;
+				selectedLaneReadyNs = laneReadyNs;
+				selectedQueueBytes = queueBytes;
+				selectedQueueDelayNs = queueDelayNs;
+				selectedPropagationNs = pathEstimate.valid
+					? pathEstimate.propagationNs
+					: firstHopPropagationNs;
+				selectedPathHops = pathEstimate.hops;
+				selectedDestinationNic =
+					pathEstimate.destinationNic;
+				selectedEndpointPinned =
+					pathEstimate.endpointPinned;
+			}
+		}
+	};
+	evaluateCandidates(false);
+	if (selected == std::numeric_limits<uint32_t>::max()) {
+		viableCandidates = 0;
+		evaluateCandidates(true);
+	}
+	if (selected == std::numeric_limits<uint32_t>::max()) {
+		return currentNic;
+	}
+
+	if (qp->m_initialSelectedNicIdx < 0) {
+		qp->m_initialSelectedNicIdx = static_cast<int32_t>(selected);
+	} else if (qp->m_selectedNicIdx >= 0 &&
+		qp->m_selectedNicIdx != static_cast<int32_t>(selected)) {
+		++qp->m_nicReassignments;
+	}
+	qp->m_selectedNicIdx = static_cast<int32_t>(selected);
+	if (selectedEndpointPinned && selectedDestinationNic >= 0) {
+		qp->m_selectedDestinationNicIdx =
+			selectedDestinationNic;
+	} else {
+		const PacketDlbEndpointPairingFilter endpointPairing =
+			GetPacketDlbEndpointPairingFilter(
+				hw->m_nic[selected].dev, destinationNode);
+		qp->m_selectedDestinationNicIdx =
+			endpointPairing.applicable &&
+				!endpointPairing.destinationNics.empty()
+			? endpointPairing.destinationNics[
+				packetHash %
+					endpointPairing.destinationNics.size()]
+			: -1;
+	}
+	qp->m_bindCandidateCount = viableCandidates;
+	qp->m_bindPathHops = selectedPathHops;
+	qp->m_bindPathScoreNs = selectedScoreNs;
+	qp->m_bindPathQueueDelayNs = selectedQueueDelayNs;
+	qp->m_bindPathPropagationNs = selectedPropagationNs;
+	qp->m_bindPathReservedBytes = 0;
+	qp->m_bindPathSignature = 0;
+	qp->m_nextAvail =
+		NanoSeconds(static_cast<int64_t>(selectedLaneReadyNs));
+
+	SwitchNode::RecordSourceFlowletDecisionStats(
+		hw->m_node->GetId(),
+		selected,
+		viableCandidates,
+		selectedQueueBytes,
+		selected < hw->tx_bytes.size() ? hw->tx_bytes[selected] : 0,
+		selectedScoreNs,
+		currentScoreNs == std::numeric_limits<uint64_t>::max()
+			? 0
+			: currentScoreNs,
+		selectedQueueDelayNs,
+		selectedPropagationNs,
+		0,
+		selectedPathHops,
+		hw->m_mtu == 0 ? 0 : seq / hw->m_mtu,
+		nowNs,
+		selected != currentNic,
+		false,
+		true,
+		false,
+		qp->sip.Get(),
+		qp->dip.Get(),
+		qp->sport,
+		qp->dport);
+	return selected;
+}
+
 uint32_t SelectPacketDlbTxNic(
 		RdmaHw* hw,
 		Ptr<RdmaQueuePair> qp,
 		uint32_t currentNic,
 		bool fixedSourceNic = false) {
+	if (!fixedSourceNic && SwitchNode::SwitchPacketDlbRoutingEnabled()) {
+		return SelectSwitchPacketDlbTxNic(hw, qp, currentNic);
+	}
 	std::vector<int> fixedCandidates;
 	if (fixedSourceNic) {
 		fixedCandidates.push_back(static_cast<int>(currentNic));
@@ -1734,7 +3096,8 @@ uint32_t SelectPacketDlbTxNic(
 			std::find(
 				candidates.begin(),
 				candidates.end(),
-				static_cast<int>(candidate)) != candidates.end();
+				static_cast<int>(candidate)) != candidates.end() &&
+			!qp->IsPacketDlbLaneWinBound(candidate);
 	};
 
 	if (qp->m_packetDlbPrepared &&
@@ -1758,9 +3121,15 @@ uint32_t SelectPacketDlbTxNic(
 	const uint32_t destinationNode = (qp->dip.Get() >> 8) & 0xffff;
 	const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
 	const bool currentLive = isLiveCandidate(currentNic);
+	const bool workConservingBulk =
+		!fixedSourceNic &&
+		qp->GetBytesLeft() >
+			packetBytes * std::max<size_t>(size_t{1}, candidates.size());
 
 	uint32_t selected = std::numeric_limits<uint32_t>::max();
 	uint32_t viableCandidates = 0;
+	uint64_t selectedLaneReadyNs = nowNs;
+	bool selectedLaneReadyNow = false;
 	PathAwareCandidate selectedPath;
 	const PacketDlbPathTemplate* selectedPathTemplate = nullptr;
 	long double selectedScore = std::numeric_limits<long double>::infinity();
@@ -1787,12 +3156,19 @@ uint32_t SelectPacketDlbTxNic(
 				if (!isLiveDevice(candidate)) {
 					continue;
 				}
+				const uint64_t laneReadyNs =
+					PacketDlbLaneNextAvailNs(qp, candidate, nowNs);
+				const bool laneReadyNow = laneReadyNs <= nowNs;
 
 				const PacketDlbPathTemplates& pathTemplates =
 					GetPacketDlbPathTemplates(
 						hw->m_nic[candidate].dev,
 						destinationNode,
 						qp->dip.Get());
+				const PacketDlbEndpointPairingFilter endpointPairing =
+					GetPacketDlbEndpointPairingFilter(
+						hw->m_nic[candidate].dev,
+						destinationNode);
 				bool sourceReachable = false;
 				long double sourceBestScore =
 					std::numeric_limits<long double>::infinity();
@@ -1803,7 +3179,8 @@ uint32_t SelectPacketDlbTxNic(
 					static_cast<uint32_t>(pathTemplates.size()),
 					PacketDlbPathSampleWidth());
 				const uint32_t pathScanLimit =
-					(threeHopOnly || twoFourHopOnly)
+					(threeHopOnly || twoFourHopOnly ||
+					 endpointPairing.applicable)
 					? static_cast<uint32_t>(pathTemplates.size())
 					: pathSampleLimit;
 				uint32_t sampledPaths = 0;
@@ -1820,6 +3197,11 @@ uint32_t SelectPacketDlbTxNic(
 						pathTemplate.size() != 4) {
 						continue;
 					}
+					if (endpointPairing.applicable &&
+						!endpointPairing.AllowsDestination(
+							PacketDlbPathDestinationNic(pathTemplate))) {
+						continue;
+					}
 					if (sampledPaths >= pathSampleLimit) {
 						break;
 					}
@@ -1830,21 +3212,36 @@ uint32_t SelectPacketDlbTxNic(
 					}
 					uint64_t projectedArrivalNs = 0;
 					if (!ProjectPacketDlbArrivalNs(
-							pathTemplate, packetBytes, &projectedArrivalNs)) {
+							pathTemplate,
+							packetBytes,
+							laneReadyNs,
+							&projectedArrivalNs)) {
 						continue;
 					}
 					sourceReachable = true;
-					const long double arrivalDelayNs =
-						static_cast<long double>(
-							projectedArrivalNs >= nowNs
-								? projectedArrivalNs - nowNs
-								: 0);
-					// Minimize the predicted flow tail, not merely the arrival
-					// of the next packet. Hop count has no score priority.
+					const uint64_t arrivalDelayNs =
+						projectedArrivalNs >= nowNs
+							? projectedArrivalNs - nowNs
+							: 0;
+					const uint64_t qpPathTailNs =
+						PacketDlbQpPathTailNs(
+							qp, pathTemplate, packetBytes);
+					const uint64_t laneWaitNs =
+						laneReadyNs >= nowNs
+							? laneReadyNs - nowNs
+							: 0;
+					const uint64_t laneAwareQpPathTailNs =
+						SaturatingAdd(laneWaitNs, qpPathTailNs);
+					// The live ETA reacts to shared congestion, while the
+					// QP-local edge ledger supplies enough lookahead to open a
+					// slower disjoint lane before the short NIC self-serializes
+					// every packet. The ledger dies with the QP, so traffic
+					// from earlier collectives cannot bias this decision.
 					const long double score =
-						PacketDlbCumulativePathWorkNs(
-							pathTemplate, packetBytes) +
-						arrivalDelayNs;
+						static_cast<long double>(
+							std::max(
+								arrivalDelayNs,
+								laneAwareQpPathTailNs));
 					if (!std::isfinite(score)) {
 						continue;
 					}
@@ -1875,12 +3272,26 @@ uint32_t SelectPacketDlbTxNic(
 					tieRank = (tieRank ^ (tieRank >> 27)) *
 						0x94d049bb133111ebULL;
 					tieRank ^= tieRank >> 31;
-					if (score < selectedCompletionScore ||
-						(score == selectedCompletionScore &&
-						 tieRank < selectedTieRank)) {
+					bool better =
+						selected ==
+							std::numeric_limits<uint32_t>::max();
+					if (!better && workConservingBulk &&
+						laneReadyNow != selectedLaneReadyNow) {
+						better = laneReadyNow;
+					} else if (!better &&
+						(!workConservingBulk ||
+						 laneReadyNow == selectedLaneReadyNow)) {
+						better =
+							score < selectedCompletionScore ||
+							(score == selectedCompletionScore &&
+							 tieRank < selectedTieRank);
+					}
+					if (better) {
 						selectedCompletionScore = score;
 						selectedTieRank = tieRank;
 						selected = candidate;
+						selectedLaneReadyNs = laneReadyNs;
+						selectedLaneReadyNow = laneReadyNow;
 						selectedPath = std::move(path);
 						selectedPathTemplate = &pathTemplate;
 						selectedScore = score;
@@ -1924,17 +3335,19 @@ uint32_t SelectPacketDlbTxNic(
 				ApplyActualPathWindow(
 					hw, qp, *selectedPathTemplate, selectedPath);
 			}
-			RecordPacketDlbCumulativePathBytes(
-				*selectedPathTemplate, packetBytes);
+			RecordPacketDlbQpPathBytes(
+				qp, *selectedPathTemplate, packetBytes);
 			selectedPath.hops.assign(
 				selectedPathTemplate->begin(), selectedPathTemplate->end());
-			ReservePacketDlbPath(selectedPath, packetBytes);
+			ReservePacketDlbPath(
+				selectedPath, packetBytes, selectedLaneReadyNs);
 			BindPacketDlbPath(qp, selectedPath, seq);
 		}
 	}
 
 	if (selected == std::numeric_limits<uint32_t>::max()) {
 		const uint32_t start = packetHash % candidates.size();
+		uint64_t fallbackReadyNs = std::numeric_limits<uint64_t>::max();
 		for (uint32_t offset = 0; offset < candidates.size(); ++offset) {
 			const int candidateValue =
 				candidates[(start + offset) % candidates.size()];
@@ -1944,9 +3357,16 @@ uint32_t SelectPacketDlbTxNic(
 			const uint32_t candidate =
 				static_cast<uint32_t>(candidateValue);
 			if (isLiveCandidate(candidate)) {
-				selected = candidate;
 				++viableCandidates;
-				break;
+				const uint64_t laneReadyNs =
+					PacketDlbLaneNextAvailNs(qp, candidate, nowNs);
+				if (selected == std::numeric_limits<uint32_t>::max() ||
+					laneReadyNs < fallbackReadyNs) {
+					selected = candidate;
+					selectedLaneReadyNs = laneReadyNs;
+					selectedLaneReadyNow = laneReadyNs <= nowNs;
+					fallbackReadyNs = laneReadyNs;
+				}
 			}
 		}
 		NS_ASSERT_MSG(
@@ -1978,6 +3398,10 @@ uint32_t SelectPacketDlbTxNic(
 	qp->m_packetDlbPrepared = true;
 	qp->m_packetDlbPreparedSeq = seq;
 	qp->m_packetDlbPreparedNicIdx = static_cast<int32_t>(selected);
+	if (!fixedSourceNic) {
+		qp->m_nextAvail = NanoSeconds(
+			static_cast<int64_t>(selectedLaneReadyNs));
+	}
 	if (recordPathStats) {
 		RecordPacketDlbPathDecision(
 			consideredPaths,
@@ -2345,11 +3769,41 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 			SwitchNode::DynamicChunkRoutingEnabled() &&
 			qp->m_sourceNicOrdinalHint !=
 				std::numeric_limits<uint32_t>::max();
-		const uint32_t start = hasSourceNicHint
+		uint32_t start = hasSourceNicHint
 			? qp->m_sourceNicOrdinalHint % v.size()
 			: qp->GetHash() % v.size();
-		for (uint32_t offset = 0; offset < v.size(); ++offset) {
-			const int candidate = v[(start + offset) % v.size()];
+		uint32_t preferredP2rCandidate = 0;
+		const bool adaptiveP2rSourceSelection =
+			hasSourceNicHint &&
+			SwitchNode::DisjointChunkRoutingEnabled() &&
+			FindP2rPreferredSourceCandidate(
+				*this,
+				v,
+				qp->m_sourceNicOrdinalHint,
+				&preferredP2rCandidate);
+			if (adaptiveP2rSourceSelection) {
+				const auto preferred = std::find(
+					v.begin(),
+					v.end(),
+					static_cast<int>(preferredP2rCandidate));
+			if (preferred != v.end()) {
+				start = static_cast<uint32_t>(
+						std::distance(v.begin(), preferred));
+				}
+			}
+			const bool capacityPinnedP2rSource =
+				adaptiveP2rSourceSelection &&
+				qp->GetInitialSize() >= kP2rCapacityPinnedChunkMinBytes;
+			for (uint32_t offset = 0; offset < v.size(); ++offset) {
+				// Large P2R chunks use worker ordinals as 4:2:2 capacity
+				// tokens. Once the preferred family is reachable, keep that
+				// token pinned while the selected family still chooses its
+				// best internal path dynamically.
+				if (capacityPinnedP2rSource &&
+					pathSelected != std::numeric_limits<uint32_t>::max()) {
+					break;
+				}
+				const int candidate = v[(start + offset) % v.size()];
 			if (candidate < 0 ||
 				static_cast<uint32_t>(candidate) >= m_nic.size() ||
 				m_nic[candidate].dev == nullptr ||
@@ -2364,7 +3818,8 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 					qp->GetHash(),
 					qp->GetInitialSize(),
 					SwitchNode::DualTableRoutingEnabled(),
-					&path)) {
+					&path,
+					qp->m_sourceNicOrdinalHint)) {
 				continue;
 			}
 			++viableCandidates;
@@ -2379,7 +3834,7 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 				bestPath = std::move(path);
 				bestScore = score;
 			}
-			if (hasSourceNicHint) {
+			if (hasSourceNicHint && !adaptiveP2rSourceSelection) {
 				qp->m_sourceNicHintFallback = offset != 0;
 				break;
 			}
@@ -2387,6 +3842,26 @@ uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp){
 
 		if (pathSelected != std::numeric_limits<uint32_t>::max()) {
 			selected = pathSelected;
+			if (adaptiveP2rSourceSelection) {
+				qp->m_sourceNicHintFallback =
+					selected != preferredP2rCandidate;
+			}
+			if (SwitchNode::DisjointChunkRoutingEnabled() &&
+				m_nic[selected].dev != nullptr) {
+				const P2rEndpointDevices p2r =
+					ClassifyP2rEndpointDevices(
+						GetGpuFabricDevices(m_nic[selected].dev->GetNode()));
+				if (p2r.valid()) {
+					const uint32_t pathFamilyParallelism =
+						std::max<uint32_t>(
+							1, qp->m_sourcePathParallelism);
+					qp->m_sourcePathParallelism =
+						m_nic[selected].dev == p2r.group1
+							? pathFamilyParallelism
+							: std::max<uint32_t>(
+								1, pathFamilyParallelism / 2);
+				}
+			}
 			selectedPathScoreNs = SaturatingNs(bestScore);
 			selectedPathQueueDelayNs = SaturatingNs(
 				SwitchNode::AdaptiveZcubeRoutingEnabled()
@@ -2821,29 +4296,38 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	qp->SetInitialSize(size);
 	qp->m_sourceNicOrdinalHint = sourceNicOrdinalHint;
 	qp->m_sourcePathParallelism = std::max<uint32_t>(1, sourcePathParallelism);
-	uint64_t packetDlbAggregateBitRate = 0;
+	const bool packetDlbCrossServer =
+		SwitchNode::PacketDlbRoutingEnabled() &&
+		src / m_gpus_per_server != dest / m_gpus_per_server;
+	qp->SetPacketDlbSelectiveCredit(
+		packetDlbCrossServer &&
+		SwitchNode::SwitchPacketDlbRoutingEnabled() &&
+		PacketDlbSelectiveCreditEnabled());
+	PacketDlbAggregateTransport packetDlbTransport;
 	uint32_t effectiveWin = win;
+	uint64_t effectiveBaseRtt = baseRtt;
 	if (SwitchNode::PacketDlbRoutingEnabled() &&
 		src / m_gpus_per_server != dest / m_gpus_per_server) {
 		std::lock_guard<std::mutex> guard(PathReservationMutex());
-		packetDlbAggregateBitRate = GetPacketDlbAggregateSourceBitRate(
-			*this, dest, dip.Get());
-		if (win > 0 && baseRtt > 0 && packetDlbAggregateBitRate > 0) {
-			const long double aggregateBdp =
-				static_cast<long double>(baseRtt) *
-				static_cast<long double>(packetDlbAggregateBitRate) /
-				8.0L / 1000000000.0L;
-			const long double maximumWindow =
-				static_cast<long double>(
-					std::numeric_limits<uint32_t>::max());
-			const uint32_t aggregateWin = aggregateBdp >= maximumWindow
-				? std::numeric_limits<uint32_t>::max()
-				: static_cast<uint32_t>(std::ceil(aggregateBdp));
+		packetDlbTransport = GetPacketDlbAggregateTransport(
+			*this, dest, dip.Get(), m_mtu);
+		if (win > 0 && packetDlbTransport.windowBytes > 0) {
+			const uint32_t aggregateWin =
+				packetDlbTransport.windowBytes >=
+					std::numeric_limits<uint32_t>::max()
+					? std::numeric_limits<uint32_t>::max()
+					: static_cast<uint32_t>(
+						packetDlbTransport.windowBytes);
 			effectiveWin = std::max(effectiveWin, aggregateWin);
 		}
+		effectiveBaseRtt = std::max(
+			effectiveBaseRtt, packetDlbTransport.maximumRttNs);
+	}
+	for (const auto& lane : packetDlbTransport.laneWindowBytes) {
+		qp->SetPacketDlbLaneWindow(lane.first, lane.second);
 	}
 	qp->SetWin(effectiveWin);
-	qp->SetBaseRtt(baseRtt);
+	qp->SetBaseRtt(effectiveBaseRtt);
 	qp->SetVarWin(m_var_win);
 	qp->SetAppNotifyCallback(notifyAppFinish);
 	qp->SetAppSentCallback(notifyAppSent);
@@ -2861,8 +4345,8 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 
 	// set init variables
 	DataRate m_bps = m_nic[nic_idx].dev->GetDataRate();
-	if (packetDlbAggregateBitRate > 0) {
-		m_bps = DataRate(packetDlbAggregateBitRate);
+	if (packetDlbTransport.bitRate > 0) {
+		m_bps = DataRate(packetDlbTransport.bitRate);
 	}
 	qp->m_rate = m_bps;
 	qp->m_max_rate = m_bps;
@@ -3000,8 +4484,30 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	rxQp->m_ecn_source.total++;
 	rxQp->m_milestone_rx = m_ack_interval;
 
+	const uint32_t sourceNode = (ch.sip >> 8) & 0xffff;
+	const uint32_t destinationNode = (ch.dip >> 8) & 0xffff;
+	const bool crossServer =
+		sourceNode / m_gpus_per_server !=
+		destinationNode / m_gpus_per_server;
+	const bool selectiveCredit =
+		PacketDlbSelectiveCreditEnabled() &&
+		crossServer &&
+		SwitchNode::SwitchPacketDlbRoutingEnabled();
+	const uint64_t receivedBytesBefore =
+		rxQp->m_packetDlbUniqueReceivedBytes;
+	const bool arrivedOutOfOrder =
+		ch.udp.seq > rxQp->ReceiverNextExpectedSeq;
 	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
-	if (x == 1 || x == 2){ //generate ACK or NACK
+	const uint64_t receivedBytesAfter =
+		rxQp->m_packetDlbUniqueReceivedBytes;
+	const uint64_t selectiveCreditBytes =
+		receivedBytesAfter >= receivedBytesBefore
+			? receivedBytesAfter - receivedBytesBefore
+			: 0;
+	if (x == 1 || x == 2 ||
+		(selectiveCredit && selectiveCreditBytes > 0)){
+		// Cumulative sequence progress and selective delivery credit are
+		// intentionally independent.
 		qbbHeader seqh;
 		seqh.SetSeq(rxQp->ReceiverNextExpectedSeq);
 		seqh.SetPG(ch.udp.pg);
@@ -3012,12 +4518,18 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 			seqh.SetCnp();
 
 		Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
+		if (selectiveCredit) {
+			newp->AddPacketTag(PacketDlbCreditTag(
+				receivedBytesAfter,
+				ch.udp.seq,
+				payload_size));
+		}
 		newp->AddHeader(seqh);
 
 		Ipv4Header head;	// Prepare IPv4 header
 		head.SetDestination(Ipv4Address(ch.sip));
 		head.SetSource(Ipv4Address(ch.dip));
-		head.SetProtocol(x == 1 ? 0xFC : 0xFD); //ack=0xFC nack=0xFD
+		head.SetProtocol(x == 2 ? 0xFD : 0xFC); //ack=0xFC nack=0xFD
 		head.SetTtl(64);
 		head.SetPayloadSize(newp->GetSize());
 		head.SetIdentification(rxQp->m_ipid++);
@@ -3036,6 +4548,13 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 		// 发送给目标 NVSwitch 的报文
 		if(did == m_node->GetId() && m_node->GetNodeType() == 2 && ch.m_tos == 4) m_nic[nic_idx].dev->SwitchAsHostSend();
 		else m_nic[nic_idx].dev->TriggerTransmit();
+			if (selectiveCredit && selectiveCreditBytes > 0) {
+				SwitchNode::RecordPacketDlbSelectiveCredit(
+				static_cast<uint32_t>(std::min<uint64_t>(
+					selectiveCreditBytes,
+					std::numeric_limits<uint32_t>::max())),
+				arrivedOutOfOrder);
+		}
 	}
 	return 0;
 }
@@ -3101,6 +4620,15 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
+		if (qp->m_packetDlbSelectiveCredit && p != nullptr) {
+			PacketDlbCreditTag creditTag;
+			if (p->PeekPacketTag(creditTag)) {
+				qp->AcknowledgeDelivered(
+					creditTag.GetDeliveredBytes(),
+					creditTag.GetReceivedSeq(),
+					creditTag.GetReceivedBytes());
+			}
+		}
 		if (!m_backto0){
 			qp->Acknowledge(seq);
 		}else {
@@ -3165,6 +4693,8 @@ int RdmaHw::ReceiverCheckSeq(uint64_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 	uint64_t expected = q->ReceiverNextExpectedSeq;
 	if (SwitchNode::PacketDlbRoutingEnabled() ||
 		SwitchNode::MultiQpPacketDlbRoutingEnabled()) {
+		const bool selectiveCredit =
+			PacketDlbSelectiveCreditEnabled();
 		if (seq < expected) {
 			SwitchNode::RecordPacketDlbReorderEvent(
 				0, q->m_reorderBufferedBytes, 0, 0, true, false);
@@ -3177,6 +4707,10 @@ int RdmaHw::ReceiverCheckSeq(uint64_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 				SwitchNode::RecordPacketDlbReorderEvent(
 					0, q->m_reorderBufferedBytes, 0, 0, true, false);
 				return 4;
+			}
+			if (selectiveCredit) {
+				q->m_packetDlbUniqueReceivedBytes = SaturatingAdd(
+					q->m_packetDlbUniqueReceivedBytes, size);
 			}
 			q->m_reorderBufferedBytes = SaturatingAdd(
 				q->m_reorderBufferedBytes, size);
@@ -3204,6 +4738,10 @@ int RdmaHw::ReceiverCheckSeq(uint64_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 			return nack ? 2 : 5;
 		}
 
+		if (selectiveCredit) {
+			q->m_packetDlbUniqueReceivedBytes = SaturatingAdd(
+				q->m_packetDlbUniqueReceivedBytes, size);
+		}
 		q->ReceiverNextExpectedSeq = SaturatingAdd(expected, size);
 		uint64_t drainedPackets = 0;
 		uint64_t drainedBytes = 0;
@@ -3384,11 +4922,24 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	ipHeader.SetIdentification (qp->m_ipid);
 	p->AddHeader(ipHeader);
 	// add ppp header
-	PppHeader ppp;
-	ppp.SetProtocol (0x0021); // EtherToPpp(0x800), see point-to-point-net-device.cc
-	p->AddHeader (ppp);
+		PppHeader ppp;
+		ppp.SetProtocol (0x0021); // EtherToPpp(0x800), see point-to-point-net-device.cc
+		p->AddHeader (ppp);
+		if (SwitchNode::SwitchPacketDlbRoutingEnabled() &&
+			qp->m_selectedDestinationNicIdx >= 0) {
+			p->AddPacketTag(PacketDlbEndpointTag(
+				static_cast<uint32_t>(
+					qp->m_selectedDestinationNicIdx)));
+		}
 
-	// update state
+		// update state
+	if (qp->m_packetDlbSelectiveCredit &&
+		qp->m_selectedNicIdx >= 0) {
+		qp->RecordPacketDlbSend(
+			qp->snd_nxt,
+			static_cast<uint32_t>(payload_size),
+			static_cast<uint32_t>(qp->m_selectedNicIdx));
+	}
 	qp->snd_nxt += payload_size;
 	// std::cout << "current snd_nxt is: " << qp->snd_nxt << ", the window is: " << qp->m_win << std::endl;
 	qp->m_ipid++;
@@ -3446,7 +4997,7 @@ void RdmaHw::PktSent(
 				pkt->GetSize());
 		}
 	}
-	UpdateNextAvail(qp, interframeGap, pkt->GetSize());
+	UpdateNextAvail(qp, interframeGap, pkt->GetSize(), sentNic);
 	if (!packetDlb || sameServer || qp->GetBytesLeft() == 0 ||
 		qp->IsWinBound()) {
 		return;
@@ -3473,7 +5024,43 @@ void RdmaHw::PktSent(
 		&QbbNetDevice::ReassignedQp, m_nic[nextNic].dev, qp);
 }
 
-void RdmaHw::UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size){
+void RdmaHw::UpdateNextAvail(
+		Ptr<RdmaQueuePair> qp,
+		Time interframeGap,
+		uint32_t pkt_size,
+		uint32_t sentNic){
+	const bool packetDlbMultiLane =
+		SwitchNode::PacketDlbRoutingEnabled() &&
+		qp->m_src / m_gpus_per_server != qp->m_dest / m_gpus_per_server &&
+		sentNic < m_nic.size() && m_nic[sentNic].dev != nullptr;
+	if (packetDlbMultiLane) {
+		const uint64_t physicalBitRate =
+			m_nic[sentNic].dev->GetDataRate().GetBitRate();
+		uint64_t effectiveBitRate = physicalBitRate;
+		if (m_rateBound && qp->m_max_rate.GetBitRate() > 0) {
+			const uint64_t aggregateRate = std::min(
+				qp->m_rate.GetBitRate(), qp->m_max_rate.GetBitRate());
+			const long double scaledRate =
+				static_cast<long double>(physicalBitRate) *
+				static_cast<long double>(aggregateRate) /
+				static_cast<long double>(qp->m_max_rate.GetBitRate());
+			effectiveBitRate = std::max<uint64_t>(
+				1,
+				std::min<uint64_t>(
+					physicalBitRate,
+					static_cast<uint64_t>(std::ceil(scaledRate))));
+		}
+		const Time sendingTime =
+			interframeGap +
+			DataRate(effectiveBitRate).CalculateBytesTxTime(pkt_size);
+		const Time laneNextAvail = Simulator::Now() + sendingTime;
+		Time& storedNextAvail =
+			qp->m_packetDlbLaneNextAvail[sentNic];
+		storedNextAvail = std::max(storedNextAvail, laneNextAvail);
+		qp->m_nextAvail = storedNextAvail;
+		return;
+	}
+
 	Time sendingTime;
 	if (m_rateBound)
 		sendingTime = interframeGap + qp->m_rate.CalculateBytesTxTime(pkt_size);
@@ -3483,6 +5070,19 @@ void RdmaHw::UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t
 }
 
 void RdmaHw::ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate){
+	if (SwitchNode::PacketDlbRoutingEnabled() &&
+		qp->m_src / m_gpus_per_server != qp->m_dest / m_gpus_per_server) {
+		qp->m_rate = new_rate;
+		const uint32_t nic_idx = GetNicIdxOfQp(qp);
+		const uint64_t nowNs = Simulator::Now().GetNanoSeconds();
+		const uint64_t laneReadyNs =
+			PacketDlbLaneNextAvailNs(qp, nic_idx, nowNs);
+		qp->m_nextAvail =
+			NanoSeconds(static_cast<int64_t>(laneReadyNs));
+		m_nic[nic_idx].dev->UpdateNextAvail(qp->m_nextAvail);
+		return;
+	}
+
 	#if 1
 	Time sendingTime = qp->m_rate.CalculateBytesTxTime(qp->lastPktSize);
 	Time new_sendintTime = new_rate.CalculateBytesTxTime(qp->lastPktSize);

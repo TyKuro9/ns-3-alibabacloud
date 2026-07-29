@@ -10,12 +10,19 @@
 #include <ns3/int-header.h>
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 namespace ns3 {
 
 class RdmaQueuePair : public Object {
 public:
+	struct PacketDlbWindowSegment {
+		uint32_t sourceNic = 0;
+		uint32_t bytes = 0;
+		bool delivered = false;
+	};
+
 	Time startTime;
 	Ipv4Address sip, dip;
 	uint16_t sport, dport;
@@ -49,12 +56,25 @@ public:
 	bool m_actualPathWindowInitialized;
 	uint32_t m_actualPathWindowBytes;
 	uint64_t m_actualPathBaseRttNs;
+	uint64_t m_actualPathBottleneckBps;
 	std::vector<int> m_packetDlbCandidates;
 	std::vector<uint32_t> m_packetDlbBoundSwitches;
 	std::map<uint64_t, std::vector<uint32_t>>
 		m_packetDlbOutstandingRoutes;
+	std::unordered_map<uint64_t, uint64_t>
+		m_packetDlbAssignedEdgeBytes;
+	std::unordered_map<uint32_t, Time>
+		m_packetDlbLaneNextAvail;
 	std::vector<uint64_t> m_pathReservationEdges;
 	uint64_t m_pathReservationBytes;
+	bool m_packetDlbSelectiveCredit;
+	uint64_t m_packetDlbDeliveredBytes;
+	std::map<uint64_t, PacketDlbWindowSegment>
+		m_packetDlbWindowSegments;
+	std::unordered_map<uint32_t, uint64_t>
+		m_packetDlbLaneOutstandingBytes;
+	std::unordered_map<uint32_t, uint64_t>
+		m_packetDlbLaneWindowBytes;
 	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
 	uint16_t m_pg;
 	uint16_t m_ipid;
@@ -138,7 +158,21 @@ public:
 	void SetTag(uint64_t tag);void SetSrc(uint32_t src);void SetDest(uint32_t dest);void SetInitialSize(uint64_t size);
 	uint32_t GetHash(void);
 	void Acknowledge(uint64_t ack);
+	void SetPacketDlbSelectiveCredit(bool enabled);
+	void SetPacketDlbLaneWindow(uint32_t sourceNic, uint64_t windowBytes);
+	void RecordPacketDlbSend(
+		uint64_t seq,
+		uint32_t bytes,
+		uint32_t sourceNic);
+	void AcknowledgeDelivered(
+		uint64_t deliveredBytes,
+		uint64_t receivedSeq,
+		uint32_t receivedBytes);
 	uint64_t GetOnTheFly();
+	uint64_t GetWindowOnTheFly();
+	uint64_t GetPacketDlbLaneWindow(uint32_t sourceNic);
+	uint64_t GetPacketDlbLaneOnTheFly(uint32_t sourceNic);
+	bool IsPacketDlbLaneWinBound(uint32_t sourceNic);
 	bool IsWinBound();
 	uint64_t GetWin(); // window size calculated from m_rate
 	bool IsFinished();
@@ -163,6 +197,7 @@ public:
 	std::map<uint64_t, uint32_t> m_reorderSegments;
 	uint64_t m_reorderBufferedBytes;
 	uint64_t m_reorderPeakBytes;
+	uint64_t m_packetDlbUniqueReceivedBytes;
 	Time m_nackTimer;
 	int32_t m_milestone_rx;
 	uint64_t m_lastNACK;

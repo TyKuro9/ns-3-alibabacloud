@@ -60,7 +60,10 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 	m_actualPathWindowInitialized = false;
 	m_actualPathWindowBytes = 0;
 	m_actualPathBaseRttNs = 0;
+	m_actualPathBottleneckBps = 0;
 	m_pathReservationBytes = 0;
+	m_packetDlbSelectiveCredit = false;
+	m_packetDlbDeliveredBytes = 0;
 	m_tag = -1;
 	snd_nxt = snd_una = 0;
 	m_pg = pg;
@@ -184,15 +187,159 @@ void RdmaQueuePair::Acknowledge(uint64_t ack){
 	if (ack > snd_una){
 		snd_una = ack;
 	}
+	if (m_packetDlbSelectiveCredit && snd_una > m_packetDlbDeliveredBytes) {
+		m_packetDlbDeliveredBytes = snd_una;
+	}
+	auto segment = m_packetDlbWindowSegments.begin();
+	while (segment != m_packetDlbWindowSegments.end()) {
+		const uint64_t endSeq =
+			segment->first + segment->second.bytes;
+		if (endSeq > snd_una) {
+			break;
+		}
+		if (!segment->second.delivered) {
+			uint64_t& outstanding =
+				m_packetDlbLaneOutstandingBytes[
+					segment->second.sourceNic];
+			outstanding = segment->second.bytes >= outstanding
+				? 0
+				: outstanding - segment->second.bytes;
+		}
+		segment = m_packetDlbWindowSegments.erase(segment);
+	}
+}
+
+void RdmaQueuePair::SetPacketDlbSelectiveCredit(bool enabled){
+	m_packetDlbSelectiveCredit = enabled;
+	if (enabled && snd_una > m_packetDlbDeliveredBytes) {
+		m_packetDlbDeliveredBytes = snd_una;
+	}
+}
+
+void RdmaQueuePair::SetPacketDlbLaneWindow(
+		uint32_t sourceNic,
+		uint64_t windowBytes){
+	if (!m_packetDlbSelectiveCredit || windowBytes == 0) {
+		return;
+	}
+	m_packetDlbLaneWindowBytes[sourceNic] = windowBytes;
+}
+
+void RdmaQueuePair::RecordPacketDlbSend(
+		uint64_t seq,
+		uint32_t bytes,
+		uint32_t sourceNic){
+	if (!m_packetDlbSelectiveCredit || bytes == 0) {
+		return;
+	}
+	const auto inserted = m_packetDlbWindowSegments.emplace(
+		seq, PacketDlbWindowSegment{sourceNic, bytes, false});
+	if (!inserted.second) {
+		return;
+	}
+	uint64_t& outstanding =
+		m_packetDlbLaneOutstandingBytes[sourceNic];
+	outstanding =
+		std::numeric_limits<uint64_t>::max() - outstanding < bytes
+			? std::numeric_limits<uint64_t>::max()
+			: outstanding + bytes;
+}
+
+void RdmaQueuePair::AcknowledgeDelivered(
+		uint64_t deliveredBytes,
+		uint64_t receivedSeq,
+		uint32_t receivedBytes){
+	if (!m_packetDlbSelectiveCredit) {
+		return;
+	}
+	m_packetDlbDeliveredBytes = std::max(
+		m_packetDlbDeliveredBytes,
+		std::min(deliveredBytes, m_size));
+	auto segment = m_packetDlbWindowSegments.find(receivedSeq);
+	if (segment == m_packetDlbWindowSegments.end() ||
+		segment->second.delivered || receivedBytes == 0) {
+		return;
+	}
+	uint64_t& outstanding =
+		m_packetDlbLaneOutstandingBytes[segment->second.sourceNic];
+	outstanding = segment->second.bytes >= outstanding
+		? 0
+		: outstanding - segment->second.bytes;
+	segment->second.delivered = true;
 }
 
 uint64_t RdmaQueuePair::GetOnTheFly(){
 	return snd_nxt - snd_una;
 }
 
+uint64_t RdmaQueuePair::GetWindowOnTheFly(){
+	if (!m_packetDlbSelectiveCredit) {
+		return GetOnTheFly();
+	}
+	uint64_t outstanding = 0;
+	for (const auto& lane : m_packetDlbLaneOutstandingBytes) {
+		outstanding =
+			std::numeric_limits<uint64_t>::max() - outstanding <
+					lane.second
+				? std::numeric_limits<uint64_t>::max()
+				: outstanding + lane.second;
+	}
+	return outstanding;
+}
+
+uint64_t RdmaQueuePair::GetPacketDlbLaneWindow(uint32_t sourceNic){
+	auto lane = m_packetDlbLaneWindowBytes.find(sourceNic);
+	if (lane == m_packetDlbLaneWindowBytes.end() || lane->second == 0) {
+		return 0;
+	}
+	if (!m_var_win || m_max_rate.GetBitRate() == 0) {
+		return lane->second;
+	}
+	const long double scaled =
+		static_cast<long double>(lane->second) *
+		static_cast<long double>(m_rate.GetBitRate()) /
+		static_cast<long double>(m_max_rate.GetBitRate());
+	if (scaled <= 1.0L) {
+		return 1;
+	}
+	if (scaled >=
+		static_cast<long double>(std::numeric_limits<uint64_t>::max())) {
+		return std::numeric_limits<uint64_t>::max();
+	}
+	return static_cast<uint64_t>(scaled);
+}
+
+uint64_t RdmaQueuePair::GetPacketDlbLaneOnTheFly(uint32_t sourceNic){
+	auto lane = m_packetDlbLaneOutstandingBytes.find(sourceNic);
+	return lane == m_packetDlbLaneOutstandingBytes.end()
+		? 0
+		: lane->second;
+}
+
+bool RdmaQueuePair::IsPacketDlbLaneWinBound(uint32_t sourceNic){
+	if (!m_packetDlbSelectiveCredit || GetWin() == 0) {
+		return false;
+	}
+	const uint64_t laneWindow = GetPacketDlbLaneWindow(sourceNic);
+	return laneWindow != 0 &&
+		GetPacketDlbLaneOnTheFly(sourceNic) >= laneWindow;
+}
+
 bool RdmaQueuePair::IsWinBound(){
 	uint64_t w = GetWin();
-	return w != 0 && GetOnTheFly() >= w;
+	if (w == 0) {
+		return false;
+	}
+	if (m_packetDlbSelectiveCredit &&
+		!m_packetDlbLaneWindowBytes.empty()) {
+		for (const auto& lane : m_packetDlbLaneWindowBytes) {
+			if (!IsPacketDlbLaneWinBound(lane.first)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return w != 0 && GetWindowOnTheFly() >= w;
 }
 
 uint64_t RdmaQueuePair::GetWin(){
@@ -244,6 +391,7 @@ RdmaRxQueuePair::RdmaRxQueuePair(){
 	ReceiverNextExpectedSeq = 0;
 	m_reorderBufferedBytes = 0;
 	m_reorderPeakBytes = 0;
+	m_packetDlbUniqueReceivedBytes = 0;
 	m_nackTimer = Time(0);
 	m_milestone_rx = 0;
 	m_lastNACK = 0;

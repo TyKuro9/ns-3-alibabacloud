@@ -170,6 +170,7 @@ public:
 	static bool DynamicChunkRoutingEnabled();
 	static bool DisjointChunkRoutingEnabled();
 	static bool PacketDlbRoutingEnabled();
+	static bool SwitchPacketDlbRoutingEnabled();
 	static bool MultiQpPacketDlbRoutingEnabled();
 	static uint64_t FlowletGapNs();
 	static uint64_t FlowletMaxBytes();
@@ -180,6 +181,13 @@ public:
 		uint64_t* scoreNs,
 		uint64_t* queueBytes,
 		uint64_t* propagationNs);
+	static bool MeasurePacketDlbPort(
+		Ptr<QbbNetDevice> device,
+		uint32_t packetBytes,
+		uint64_t* scoreNs,
+		uint64_t* queueBytes,
+		uint64_t* propagationNs,
+		uint64_t* busyNs);
 	static void RecordRouteChoiceStats(
 		uint32_t switchId,
 		uint32_t nodeType,
@@ -249,6 +257,9 @@ public:
 		uint64_t drainedBytes,
 		bool duplicate,
 		bool nack);
+	static void RecordPacketDlbSelectiveCredit(
+		uint32_t packetBytes,
+		bool outOfOrder);
 	static void RecordSourceQpBindingStats(
 		bool dynamic,
 		bool pathAware,

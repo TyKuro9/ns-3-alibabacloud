@@ -32,6 +32,7 @@ build_lib(
     model/qbb-channel.cc
     model/qbb-remote-channel.cc
     model/rdma-driver.cc
+    model/packet-dlb-tag.cc
     model/rdma-queue-pair.cc
     model/rdma-hw.cc
     model/switch-node.cc
@@ -54,6 +55,7 @@ build_lib(
     model/qbb-channel.h
     model/qbb-remote-channel.h
     model/rdma-driver.h
+    model/packet-dlb-tag.h
     model/rdma-queue-pair.h
     model/rdma-hw.h
     model/switch-node.h

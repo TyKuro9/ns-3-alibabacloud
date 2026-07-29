@@ -119,7 +119,11 @@ public:
 		Ptr<Packet> pkt,
 		Time interframeGap,
 		uint32_t sentNic);
-	void UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size);
+	void UpdateNextAvail(
+		Ptr<RdmaQueuePair> qp,
+		Time interframeGap,
+		uint32_t pkt_size,
+		uint32_t sentNic);
 	void ChangeRate(Ptr<RdmaQueuePair> qp, DataRate new_rate);
 	/******************************
 	 * Mellanox's version of DCQCN

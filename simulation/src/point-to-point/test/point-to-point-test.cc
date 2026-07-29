@@ -24,6 +24,8 @@
 #include "ns3/point-to-point-net-device.h"
 #include "ns3/point-to-point-channel.h"
 #include "ns3/net-device-queue-interface.h"
+#include "ns3/packet-dlb-tag.h"
+#include "ns3/rdma-queue-pair.h"
 
 #include <string>
 
@@ -130,6 +132,69 @@ PointToPointTest::DoRun (void)
   Simulator::Destroy ();
 }
 
+class PacketDlbSelectiveCreditTest : public TestCase
+{
+public:
+  PacketDlbSelectiveCreditTest ()
+    : TestCase ("Packet DLB selective credit releases the send window without completing the QP")
+  {
+  }
+
+  void DoRun () override
+  {
+    Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair> (
+        3,
+        Ipv4Address ("10.0.0.1"),
+        Ipv4Address ("10.0.0.2"),
+        1000,
+        2000);
+    qp->SetSize (36000);
+    qp->SetWin (18000);
+    qp->snd_nxt = 18000;
+
+    NS_TEST_EXPECT_MSG_EQ (qp->IsWinBound (), true,
+                           "the cumulative window should initially be full");
+
+    qp->SetPacketDlbSelectiveCredit (true);
+    qp->SetPacketDlbLaneWindow (0, 9000);
+    qp->SetPacketDlbLaneWindow (1, 9000);
+    qp->RecordPacketDlbSend (0, 9000, 0);
+    qp->RecordPacketDlbSend (9000, 9000, 1);
+    NS_TEST_EXPECT_MSG_EQ (qp->IsWinBound (), true,
+                           "all lane windows should initially be full");
+    qp->AcknowledgeDelivered (9000, 9000, 9000);
+
+    NS_TEST_EXPECT_MSG_EQ (qp->GetOnTheFly (), 18000,
+                           "selective credit must not advance cumulative ACK state");
+    NS_TEST_EXPECT_MSG_EQ (qp->GetWindowOnTheFly (), 9000,
+                           "one independently delivered packet should return its credit");
+    NS_TEST_EXPECT_MSG_EQ (qp->IsWinBound (), false,
+                           "returned credit should permit another packet");
+    NS_TEST_EXPECT_MSG_EQ (qp->IsFinished (), false,
+                           "selective credit must not complete the QP");
+
+    qp->snd_nxt = 36000;
+    qp->AcknowledgeDelivered (36000, 0, 9000);
+    NS_TEST_EXPECT_MSG_EQ (qp->IsFinished (), false,
+                           "all delivery credit still must not replace cumulative ACK");
+    qp->Acknowledge (36000);
+    NS_TEST_EXPECT_MSG_EQ (qp->IsFinished (), true,
+                           "cumulative ACK should retain completion authority");
+
+    Ptr<Packet> packet = Create<Packet> ();
+    packet->AddPacketTag (PacketDlbCreditTag (123456, 9000, 9000));
+    PacketDlbCreditTag decoded;
+    NS_TEST_EXPECT_MSG_EQ (packet->PeekPacketTag (decoded), true,
+                           "selective credit tag should survive packet metadata handling");
+    NS_TEST_EXPECT_MSG_EQ (decoded.GetDeliveredBytes (), 123456,
+                           "selective credit tag should preserve its byte counter");
+    NS_TEST_EXPECT_MSG_EQ (decoded.GetReceivedSeq (), 9000,
+                           "selective credit tag should preserve packet sequence");
+    NS_TEST_EXPECT_MSG_EQ (decoded.GetReceivedBytes (), 9000,
+                           "selective credit tag should preserve packet size");
+  }
+};
+
 /**
  * \brief TestSuite for PointToPoint module
  */
@@ -146,6 +211,7 @@ PointToPointTestSuite::PointToPointTestSuite ()
   : TestSuite ("devices-point-to-point", UNIT)
 {
   AddTestCase (new PointToPointTest, TestCase::QUICK);
+  AddTestCase (new PacketDlbSelectiveCreditTest, TestCase::QUICK);
 }
 
 static PointToPointTestSuite g_pointToPointTestSuite; //!< The testsuite

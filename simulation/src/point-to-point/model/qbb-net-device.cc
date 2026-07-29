@@ -241,6 +241,7 @@ namespace ns3 {
 	QbbNetDevice::QbbNetDevice()
 	{
 		NS_LOG_FUNCTION(this);
+		m_txBusyUntil = Seconds(0);
 		m_ecn_source = new std::vector<ECNAccount>;
 		for (uint32_t i = 0; i < qCnt; i++){
 			m_paused[i] = false;
@@ -271,6 +272,7 @@ namespace ns3 {
 		NS_LOG_FUNCTION(this);
 		NS_ASSERT_MSG(m_txMachineState == BUSY, "Must be BUSY if transmitting");
 		m_txMachineState = READY;
+		m_txBusyUntil = Simulator::Now();
 		NS_ASSERT_MSG(m_currentPkt != 0, "QbbNetDevice::TransmitComplete(): m_currentPkt zero");
 		m_phyTxEndTrace(m_currentPkt);
 		m_currentPkt = 0;
@@ -281,6 +283,7 @@ namespace ns3 {
 		NS_LOG_FUNCTION(this);
 		NS_ASSERT_MSG(m_txMachineState == BUSY, "Must be BUSY if transmitting");
 		m_txMachineState = READY;
+		m_txBusyUntil = Simulator::Now();
 		NS_ASSERT_MSG(m_currentPkt != 0, "QbbNetDevice::TransmitComplete(): m_currentPkt zero");
 		m_phyTxEndTrace(m_currentPkt);
 		m_currentPkt = 0;
@@ -644,9 +647,10 @@ namespace ns3 {
 		m_txMachineState = BUSY;
 		m_currentPkt = p;
 		m_phyTxBeginTrace(m_currentPkt);
-		Time txTime = m_bps.CalculateBytesTxTime(p->GetSize());
-		Time txCompleteTime = txTime + m_tInterframeGap;
-		NS_LOG_LOGIC("Schedule TransmitCompleteEvent in " << txCompleteTime.GetSeconds() << "sec");
+			Time txTime = m_bps.CalculateBytesTxTime(p->GetSize());
+			Time txCompleteTime = txTime + m_tInterframeGap;
+			m_txBusyUntil = Simulator::Now() + txCompleteTime;
+			NS_LOG_LOGIC("Schedule TransmitCompleteEvent in " << txCompleteTime.GetSeconds() << "sec");
 		Simulator::Schedule(txCompleteTime, &QbbNetDevice::TransmitComplete, this);
 
 		bool result = m_channel->TransmitStart(p, this, txTime);
@@ -673,9 +677,10 @@ namespace ns3 {
 		m_txMachineState = BUSY;
 		m_currentPkt = p;
 		m_phyTxBeginTrace(m_currentPkt);
-		Time txTime = m_bps.CalculateBytesTxTime(p->GetSize());
-		Time txCompleteTime = txTime + m_tInterframeGap;
-		// std::cout << "txCompleteTime: " << txCompleteTime << std::endl;
+			Time txTime = m_bps.CalculateBytesTxTime(p->GetSize());
+			Time txCompleteTime = txTime + m_tInterframeGap;
+			m_txBusyUntil = Simulator::Now() + txCompleteTime;
+			// std::cout << "txCompleteTime: " << txCompleteTime << std::endl;
 		NS_LOG_LOGIC("Schedule TransmitCompleteEvent in " << txCompleteTime.GetSeconds() << "sec");
 		Simulator::Schedule(txCompleteTime, &QbbNetDevice::SwitchAsHostTransmitComplete, this);
 
@@ -715,9 +720,21 @@ namespace ns3 {
 		m_queue = q;
 	}
 
-	Ptr<BEgressQueue> QbbNetDevice::GetQueue(){
-		return m_queue;
-	}
+		Ptr<BEgressQueue> QbbNetDevice::GetQueue(){
+			return m_queue;
+		}
+
+		uint64_t QbbNetDevice::GetTxRemainingNs() const {
+			if (m_txMachineState != BUSY || m_txBusyUntil <= Simulator::Now()) {
+				return 0;
+			}
+			return static_cast<uint64_t>(
+				(m_txBusyUntil - Simulator::Now()).GetNanoSeconds());
+		}
+
+		bool QbbNetDevice::IsPriorityPaused(uint32_t qIndex) const {
+			return qIndex < qCnt && m_paused[qIndex];
+		}
 
 	Ptr<RdmaEgressQueue> QbbNetDevice::GetRdmaQueue(){
 		return m_rdmaEQ;

@@ -119,9 +119,11 @@ public:
 
    virtual Ptr<Channel> GetChannel (void) const;
 
-   void SetQueue (Ptr<BEgressQueue> q);
-   Ptr<BEgressQueue> GetQueue ();
-   virtual bool IsQbb(void) const;
+	   void SetQueue (Ptr<BEgressQueue> q);
+	   Ptr<BEgressQueue> GetQueue ();
+	   uint64_t GetTxRemainingNs () const;
+	   bool IsPriorityPaused (uint32_t qIndex) const;
+	   virtual bool IsQbb(void) const;
    void NewQp(Ptr<RdmaQueuePair> qp);
    void ReassignedQp(Ptr<RdmaQueuePair> qp);
    void TriggerTransmit();
@@ -159,7 +161,8 @@ protected:
    * @see class Queue
    * @see class InfiniteQueue
    */
-  Ptr<BEgressQueue> m_queue;
+	  Ptr<BEgressQueue> m_queue;
+	  Time m_txBusyUntil;
 
   Ptr<QbbChannel> m_channel;
   

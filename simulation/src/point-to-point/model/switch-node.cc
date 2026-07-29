@@ -11,7 +11,9 @@
 #include "qbb-channel.h"
 #include "ppp-header.h"
 #include "ns3/int-header.h"
+#include "ns3/node-list.h"
 #include "ns3/simulator.h"
+#include "packet-dlb-tag.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -21,12 +23,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace ns3 {
 
@@ -169,7 +174,23 @@ std::atomic<uint64_t>& PacketDlbReorderNacks() {
 	return count;
 }
 
+std::atomic<uint64_t>& PacketDlbSelectiveCreditAcks() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbSelectiveCreditBytes() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
+std::atomic<uint64_t>& PacketDlbSelectiveCreditOutOfOrderAcks() {
+	static std::atomic<uint64_t> count{0};
+	return count;
+}
+
 constexpr size_t kPathLengthBuckets = 8;
+constexpr size_t kSourceDeviceBuckets = 16;
 
 std::array<std::atomic<uint64_t>, kPathLengthBuckets>& PathBindingCounts() {
 	static std::array<std::atomic<uint64_t>, kPathLengthBuckets> counts{};
@@ -179,6 +200,15 @@ std::array<std::atomic<uint64_t>, kPathLengthBuckets>& PathBindingCounts() {
 std::array<std::atomic<uint64_t>, kPathLengthBuckets>& PathBindingBytes() {
 	static std::array<std::atomic<uint64_t>, kPathLengthBuckets> bytes{};
 	return bytes;
+}
+
+std::array<
+	std::array<std::atomic<uint64_t>, kPathLengthBuckets>,
+	kSourceDeviceBuckets>& SourcePathDecisionCounts() {
+	static std::array<
+		std::array<std::atomic<uint64_t>, kPathLengthBuckets>,
+		kSourceDeviceBuckets> counts{};
+	return counts;
 }
 
 std::map<RouteChoiceKey, RouteChoiceStats>& RouteChoiceTable() {
@@ -216,6 +246,165 @@ const std::string& RoutingPolicyValue() {
 	return normalized;
 }
 
+struct SwitchDlbEndpointKey {
+	uint32_t destinationNode;
+	uint32_t destinationNic;
+
+	bool operator<(const SwitchDlbEndpointKey& other) const {
+		if (destinationNode != other.destinationNode) {
+			return destinationNode < other.destinationNode;
+		}
+		return destinationNic < other.destinationNic;
+	}
+};
+
+using SwitchDlbEndpointRoutes =
+	std::unordered_map<uint32_t, std::vector<int>>;
+
+std::map<
+	SwitchDlbEndpointKey,
+	std::shared_ptr<const SwitchDlbEndpointRoutes>>&
+SwitchDlbEndpointRouteCache() {
+	static std::map<
+		SwitchDlbEndpointKey,
+		std::shared_ptr<const SwitchDlbEndpointRoutes>> cache;
+	return cache;
+}
+
+std::mutex& SwitchDlbEndpointRouteCacheMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+Ptr<QbbNetDevice> SwitchDlbPeerDevice(Ptr<QbbNetDevice> device) {
+	if (device == nullptr) {
+		return nullptr;
+	}
+	Ptr<QbbChannel> channel =
+		DynamicCast<QbbChannel>(device->GetChannel());
+	if (channel == nullptr || channel->GetNDevices() != 2) {
+		return nullptr;
+	}
+	for (uint32_t index = 0; index < channel->GetNDevices(); ++index) {
+		Ptr<QbbNetDevice> peer = channel->GetQbbDevice(index);
+		if (peer != device) {
+			return peer;
+		}
+	}
+	return nullptr;
+}
+
+std::shared_ptr<const SwitchDlbEndpointRoutes>
+BuildSwitchDlbEndpointRoutes(
+		uint32_t destinationNode,
+		uint32_t destinationNic) {
+	auto routes = std::make_shared<SwitchDlbEndpointRoutes>();
+	Ptr<Node> destination = NodeList::GetNode(destinationNode);
+	if (destination == nullptr ||
+		destinationNic >= destination->GetNDevices()) {
+		return routes;
+	}
+	Ptr<QbbNetDevice> destinationDevice = DynamicCast<QbbNetDevice>(
+		destination->GetDevice(destinationNic));
+	Ptr<QbbNetDevice> targetSwitchDevice =
+		SwitchDlbPeerDevice(destinationDevice);
+	Ptr<Node> targetSwitch = targetSwitchDevice == nullptr
+		? nullptr
+		: targetSwitchDevice->GetNode();
+	if (targetSwitch == nullptr || targetSwitch->GetNodeType() != 1) {
+		return routes;
+	}
+
+	std::unordered_map<uint32_t, uint32_t> distance;
+	std::deque<Ptr<Node>> frontier;
+	distance[targetSwitch->GetId()] = 0;
+	frontier.push_back(targetSwitch);
+	while (!frontier.empty()) {
+		Ptr<Node> current = frontier.front();
+		frontier.pop_front();
+		const uint32_t currentDistance = distance[current->GetId()];
+		for (uint32_t deviceIndex = 0;
+			 deviceIndex < current->GetNDevices();
+			 ++deviceIndex) {
+			Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(
+				current->GetDevice(deviceIndex));
+			if (device == nullptr || !device->IsLinkUp()) {
+				continue;
+			}
+			Ptr<QbbNetDevice> peer = SwitchDlbPeerDevice(device);
+			Ptr<Node> neighbor = peer == nullptr ? nullptr : peer->GetNode();
+			if (neighbor == nullptr || neighbor->GetNodeType() != 1 ||
+				distance.find(neighbor->GetId()) != distance.end()) {
+				continue;
+			}
+			distance[neighbor->GetId()] = currentDistance + 1;
+			frontier.push_back(neighbor);
+		}
+	}
+
+	for (const auto& item : distance) {
+		const uint32_t switchId = item.first;
+		const uint32_t switchDistance = item.second;
+		Ptr<Node> current = NodeList::GetNode(switchId);
+		if (current == nullptr) {
+			continue;
+		}
+		std::vector<int>& nextHops = (*routes)[switchId];
+		if (switchId == targetSwitch->GetId()) {
+			nextHops.push_back(
+				static_cast<int>(targetSwitchDevice->GetIfIndex()));
+			continue;
+		}
+		for (uint32_t deviceIndex = 0;
+			 deviceIndex < current->GetNDevices();
+			 ++deviceIndex) {
+			Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(
+				current->GetDevice(deviceIndex));
+			if (device == nullptr || !device->IsLinkUp()) {
+				continue;
+			}
+			Ptr<QbbNetDevice> peer = SwitchDlbPeerDevice(device);
+			Ptr<Node> neighbor = peer == nullptr ? nullptr : peer->GetNode();
+			if (neighbor == nullptr || neighbor->GetNodeType() != 1) {
+				continue;
+			}
+			auto neighborDistance = distance.find(neighbor->GetId());
+			if (neighborDistance != distance.end() &&
+				neighborDistance->second + 1 == switchDistance) {
+				nextHops.push_back(static_cast<int>(device->GetIfIndex()));
+			}
+		}
+		std::sort(nextHops.begin(), nextHops.end());
+		nextHops.erase(
+			std::unique(nextHops.begin(), nextHops.end()),
+			nextHops.end());
+	}
+	return routes;
+}
+
+std::shared_ptr<const SwitchDlbEndpointRoutes>
+GetSwitchDlbEndpointRoutes(
+		uint32_t destinationNode,
+		uint32_t destinationNic) {
+	const SwitchDlbEndpointKey key{destinationNode, destinationNic};
+	std::lock_guard<std::mutex> guard(
+		SwitchDlbEndpointRouteCacheMutex());
+	auto found = SwitchDlbEndpointRouteCache().find(key);
+	if (found != SwitchDlbEndpointRouteCache().end()) {
+		return found->second;
+	}
+	std::shared_ptr<const SwitchDlbEndpointRoutes> routes =
+		BuildSwitchDlbEndpointRoutes(destinationNode, destinationNic);
+	SwitchDlbEndpointRouteCache()[key] = routes;
+	return routes;
+}
+
+void ClearSwitchDlbEndpointRoutes() {
+	std::lock_guard<std::mutex> guard(
+		SwitchDlbEndpointRouteCacheMutex());
+	SwitchDlbEndpointRouteCache().clear();
+}
+
 bool UseDisjointChunkRoutingImpl() {
 	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_disjoint_chunk" ||
@@ -231,10 +420,23 @@ bool UseDynamicChunkRoutingImpl() {
 		policy == "chunk_adaptive" || UseDisjointChunkRoutingImpl();
 }
 
-bool UsePacketDlbRoutingImpl() {
+bool UseSourcePathPacketDlbRoutingImpl() {
 	const std::string& policy = RoutingPolicyValue();
 	return policy == "spray_packet_dlb" || policy == "packet_dlb" ||
 		policy == "packet_spray" || policy == "dlb_spray";
+}
+
+bool UseSwitchPacketDlbRoutingImpl() {
+	const std::string& policy = RoutingPolicyValue();
+	return policy == "spray_switch_dlb" ||
+		policy == "switch_packet_dlb" ||
+		policy == "hop_by_hop_dlb" ||
+		policy == "packet_dlb_hop_by_hop";
+}
+
+bool UsePacketDlbRoutingImpl() {
+	return UseSourcePathPacketDlbRoutingImpl() ||
+		UseSwitchPacketDlbRoutingImpl();
 }
 
 bool UseMultiQpPacketDlbRoutingImpl() {
@@ -473,6 +675,14 @@ void RecordFlowletDecisionRawImpl(
 		if (switched) {
 			SourceFlowletSwitchCount().fetch_add(1, std::memory_order_relaxed);
 		}
+		if (pathHops > 0) {
+			const size_t deviceBucket = std::min<size_t>(
+				outDev, kSourceDeviceBuckets - 1);
+			const size_t pathBucket = std::min<size_t>(
+				pathHops, kPathLengthBuckets - 1);
+			SourcePathDecisionCounts()[deviceBucket][pathBucket].fetch_add(
+				1, std::memory_order_relaxed);
+		}
 	}
 }
 
@@ -572,11 +782,13 @@ void DumpRouteChoiceStatsImpl(const std::string& path) {
 			const char* routingMode = UseMultiQpPacketDlbRoutingImpl()
 				? "multi_qp_packet_dlb"
 				: "ecmp_hash";
-			if (isDynamic) {
-				if (UseMultiQpPacketDlbRoutingImpl()) {
-					routingMode = "multi_qp_packet_dlb";
-				} else if (UsePacketDlbRoutingImpl()) {
-					routingMode = "packet_dlb";
+				if (isDynamic) {
+					if (UseMultiQpPacketDlbRoutingImpl()) {
+						routingMode = "multi_qp_packet_dlb";
+					} else if (UseSwitchPacketDlbRoutingImpl()) {
+						routingMode = "switch_packet_dlb";
+					} else if (UsePacketDlbRoutingImpl()) {
+						routingMode = "packet_dlb";
 				} else if (UseDisjointChunkRoutingImpl()) {
 					routingMode = "disjoint_chunk_qp";
 				} else if (UseDynamicChunkRoutingImpl()) {
@@ -782,8 +994,26 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 	if (entry == m_rtTable.end())
 		return -1;
 
-	// entry found
-	auto &nexthops = entry->second;
+	// Endpoint-aware DLB keeps each packet on a shortest-path DAG to the
+	// selected physical destination NIC. The target is metadata, not a
+	// source-selected route; every switch still chooses its own next hop.
+	const std::vector<int>* nextHopList = &entry->second;
+	std::shared_ptr<const SwitchDlbEndpointRoutes> endpointRoutes;
+	if (SwitchPacketDlbRoutingEnabled() && ch.l3Prot == 0x11 &&
+		p != nullptr) {
+		PacketDlbEndpointTag endpointTag;
+		if (p->PeekPacketTag(endpointTag)) {
+			const uint32_t destinationNode = (ch.dip >> 8) & 0xffff;
+			endpointRoutes = GetSwitchDlbEndpointRoutes(
+				destinationNode, endpointTag.GetDestinationNic());
+			auto endpointNextHops = endpointRoutes->find(GetId());
+			if (endpointNextHops != endpointRoutes->end() &&
+				!endpointNextHops->second.empty()) {
+				nextHopList = &endpointNextHops->second;
+			}
+		}
+	}
+	const std::vector<int>& nexthops = *nextHopList;
 	if (nexthops.empty())
 		return -1;
 
@@ -1033,37 +1263,49 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 		int bestDev = -1;
 		uint64_t bestScoreNs = std::numeric_limits<uint64_t>::max();
 		uint64_t bestQueueBytes = std::numeric_limits<uint64_t>::max();
-		uint64_t bestTxBytes = std::numeric_limits<uint64_t>::max();
+		uint64_t bestTxBytes = 0;
 		uint32_t candidateCount = 0;
-		for (uint32_t offset = 0; offset < nexthops.size(); ++offset) {
-			const int candidate = nexthops[(start + offset) % nexthops.size()];
-			if (candidate < 0 ||
-				static_cast<uint32_t>(candidate) >= GetNDevices() ||
-				!m_devices[candidate]->IsLinkUp()) {
-				continue;
+		auto evaluatePacketDlbPorts = [&](bool allowPaused) {
+			for (uint32_t offset = 0; offset < nexthops.size(); ++offset) {
+				const int candidate =
+					nexthops[(start + offset) % nexthops.size()];
+				if (candidate < 0 ||
+					static_cast<uint32_t>(candidate) >= GetNDevices() ||
+					!m_devices[candidate]->IsLinkUp()) {
+					continue;
+				}
+				Ptr<QbbNetDevice> device =
+					DynamicCast<QbbNetDevice>(m_devices[candidate]);
+				if (device == nullptr ||
+					(!allowPaused &&
+					 device->IsPriorityPaused(ch.udp.pg))) {
+					continue;
+				}
+				uint64_t scoreNs = 0;
+				uint64_t queueBytes = 0;
+				uint64_t propagationNs = 0;
+				uint64_t busyNs = 0;
+				if (!MeasurePacketDlbPort(
+						device, p == nullptr ? 0 : p->GetSize(),
+						&scoreNs, &queueBytes, &propagationNs, &busyNs)) {
+					continue;
+				}
+				++candidateCount;
+				if (scoreNs < bestScoreNs) {
+					bestDev = candidate;
+					bestScoreNs = scoreNs;
+					bestQueueBytes = queueBytes;
+					bestTxBytes =
+						static_cast<uint32_t>(candidate) < pCnt
+							? m_txBytes[candidate]
+							: 0;
+				}
 			}
-			uint64_t scoreNs = 0;
-			uint64_t queueBytes = 0;
-			uint64_t propagationNs = 0;
-			Ptr<QbbNetDevice> device =
-				DynamicCast<QbbNetDevice>(m_devices[candidate]);
-			if (!MeasureFlowletPort(
-					device, p == nullptr ? 0 : p->GetSize(),
-					&scoreNs, &queueBytes, &propagationNs)) {
-				continue;
-			}
-			++candidateCount;
-			const uint64_t txBytes =
-				static_cast<uint32_t>(candidate) < pCnt
-					? m_txBytes[candidate]
-					: 0;
-			if (scoreNs < bestScoreNs ||
-				(scoreNs == bestScoreNs && txBytes < bestTxBytes)) {
-				bestDev = candidate;
-				bestScoreNs = scoreNs;
-				bestQueueBytes = queueBytes;
-				bestTxBytes = txBytes;
-			}
+		};
+		evaluatePacketDlbPorts(false);
+		if (bestDev < 0) {
+			candidateCount = 0;
+			evaluatePacketDlbPorts(true);
 		}
 		if (bestDev >= 0) {
 			RecordFlowletDecisionStats(
@@ -1135,6 +1377,20 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 		auto entry = m_rtTable.find(ch.dip);
 		uint32_t nextHopCount =
 			entry == m_rtTable.end() ? 0 : static_cast<uint32_t>(entry->second.size());
+		if (SwitchPacketDlbRoutingEnabled() && ch.l3Prot == 0x11) {
+			PacketDlbEndpointTag endpointTag;
+			if (p->PeekPacketTag(endpointTag)) {
+				const uint32_t destinationNode = (ch.dip >> 8) & 0xffff;
+				auto endpointRoutes = GetSwitchDlbEndpointRoutes(
+					destinationNode, endpointTag.GetDestinationNic());
+				auto endpointNextHops = endpointRoutes->find(GetId());
+				if (endpointNextHops != endpointRoutes->end() &&
+					!endpointNextHops->second.empty()) {
+					nextHopCount = static_cast<uint32_t>(
+						endpointNextHops->second.size());
+				}
+			}
+		}
 		RecordRouteChoiceStats(
 			GetId(), GetNodeType(), inDev, idx, ch, p->GetSize(), nextHopCount);
 		m_bytes[inDev][idx][qIndex] += p->GetSize();
@@ -1194,6 +1450,7 @@ void SwitchNode::AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx){
 
 void SwitchNode::ClearTable(){
 	m_rtTable.clear();
+	ClearSwitchDlbEndpointRoutes();
 }
 
 const std::vector<int>* SwitchNode::GetRouteNextHops(uint32_t dip) const {
@@ -1457,6 +1714,10 @@ bool SwitchNode::PacketDlbRoutingEnabled() {
 	return UsePacketDlbRoutingImpl();
 }
 
+bool SwitchNode::SwitchPacketDlbRoutingEnabled() {
+	return UseSwitchPacketDlbRoutingImpl();
+}
+
 bool SwitchNode::MultiQpPacketDlbRoutingEnabled() {
 	return UseMultiQpPacketDlbRoutingImpl();
 }
@@ -1504,6 +1765,27 @@ bool SwitchNode::MeasureFlowletPort(
 	*scoreNs = totalNs >= maximum
 		? std::numeric_limits<uint64_t>::max()
 		: static_cast<uint64_t>(std::llround(totalNs));
+	return true;
+}
+
+bool SwitchNode::MeasurePacketDlbPort(
+		Ptr<QbbNetDevice> device,
+		uint32_t packetBytes,
+		uint64_t* scoreNs,
+		uint64_t* queueBytes,
+		uint64_t* propagationNs,
+		uint64_t* busyNs) {
+	if (!MeasureFlowletPort(
+			device, packetBytes, scoreNs, queueBytes, propagationNs) ||
+		busyNs == nullptr) {
+		return false;
+	}
+	*busyNs = device->GetTxRemainingNs();
+	if (*scoreNs > std::numeric_limits<uint64_t>::max() - *busyNs) {
+		*scoreNs = std::numeric_limits<uint64_t>::max();
+	} else {
+		*scoreNs += *busyNs;
+	}
 	return true;
 }
 
@@ -1687,6 +1969,22 @@ void SwitchNode::RecordPacketDlbReorderEvent(
 	}
 }
 
+void SwitchNode::RecordPacketDlbSelectiveCredit(
+		uint32_t packetBytes,
+		bool outOfOrder) {
+	if (!RoutingStatsEnabledImpl() || packetBytes == 0) {
+		return;
+	}
+	PacketDlbSelectiveCreditAcks().fetch_add(
+		1, std::memory_order_relaxed);
+	PacketDlbSelectiveCreditBytes().fetch_add(
+		packetBytes, std::memory_order_relaxed);
+	if (outOfOrder) {
+		PacketDlbSelectiveCreditOutOfOrderAcks().fetch_add(
+			1, std::memory_order_relaxed);
+	}
+}
+
 void SwitchNode::RecordSourceQpBindingStats(
 		bool dynamic,
 		bool pathAware,
@@ -1811,6 +2109,20 @@ void SwitchNode::PrintFlowletRoutingSummary() {
 		<< " source_switches="
 		<< SourceFlowletSwitchCount().load(std::memory_order_relaxed)
 		;
+	for (size_t device = 0; device < kSourceDeviceBuckets; ++device) {
+		for (size_t path = 1; path < kPathLengthBuckets; ++path) {
+			const uint64_t decisions =
+				SourcePathDecisionCounts()[device][path].load(
+					std::memory_order_relaxed);
+			if (decisions == 0) {
+				continue;
+			}
+			std::cout << " source_dev" << device
+				<< "_h" << path
+				<< (path == kPathLengthBuckets - 1 ? "plus" : "")
+				<< "_decisions=" << decisions;
+		}
+	}
 	if (PacketDlbRoutingEnabled() || MultiQpPacketDlbRoutingEnabled()) {
 		std::cout << " reordered_packets="
 			<< PacketDlbOutOfOrderPackets().load(std::memory_order_relaxed)
@@ -1827,7 +2139,16 @@ void SwitchNode::PrintFlowletRoutingSummary() {
 			<< " duplicate_packets="
 			<< PacketDlbDuplicatePackets().load(std::memory_order_relaxed)
 			<< " reorder_nacks="
-			<< PacketDlbReorderNacks().load(std::memory_order_relaxed);
+			<< PacketDlbReorderNacks().load(std::memory_order_relaxed)
+			<< " selective_credit_acks="
+			<< PacketDlbSelectiveCreditAcks().load(
+				std::memory_order_relaxed)
+			<< " selective_credit_bytes="
+			<< PacketDlbSelectiveCreditBytes().load(
+				std::memory_order_relaxed)
+			<< " selective_credit_ooo_acks="
+			<< PacketDlbSelectiveCreditOutOfOrderAcks().load(
+				std::memory_order_relaxed);
 	}
 	std::cout << std::endl;
 }
